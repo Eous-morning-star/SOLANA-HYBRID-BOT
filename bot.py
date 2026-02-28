@@ -150,8 +150,19 @@ def ds_boosts_top() -> List[Dict[str, Any]]:
     return http_get(f"{BASE}/token-boosts/top/v1")  # :contentReference[oaicite:9]{index=9}
 
 
-def ds_orders(chain_id: str, token_address: str) -> List[Dict[str, Any]]:
-    return http_get(f"{BASE}/orders/v1/{chain_id}/{token_address}")  # :contentReference[oaicite:10]{index=10}
+def ds_orders(chain_id: str, token_address: str):
+    data = http_get(f"{BASE}/orders/v1/{chain_id}/{token_address}")
+
+    # Normalize to list
+    if isinstance(data, list):
+        return data
+
+    if isinstance(data, dict):
+        if "data" in data and isinstance(data["data"], list):
+            return data["data"]
+        return []
+
+    return []
 
 
 # -------------------------
@@ -468,20 +479,27 @@ async def orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         items = ds_orders(chain, token)
+
         if not items:
-            await update.message.reply_text("No paid orders found (or none returned).")
+            await update.message.reply_text("No paid orders found.")
             return
-        # preview a few orders
+
         lines = [f"Orders for {token} [{chain}] (preview):"]
-        for it in items[:8]:
+
+        for it in items[:min(8, len(items))]:
+            if not isinstance(it, dict):
+                continue
+
             lines.append(
-                f"• type={it.get('type')} | status={it.get('status')} | paymentTs={it.get('paymentTimestamp')}"
+                f"• type={it.get('type')} | "
+                f"status={it.get('status')} | "
+                f"paymentTs={it.get('paymentTimestamp')}"
             )
+
         await update.message.reply_text("\n".join(lines))
 
     except Exception as e:
         await update.message.reply_text(f"Error: {e}")
-
 
 def main():
     if not BOT_TOKEN:
