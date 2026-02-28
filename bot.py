@@ -1,5 +1,5 @@
 import os
-import time
+import re
 import requests
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -11,18 +11,9 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 BASE = "https://api.dexscreener.com"
 TIMEOUT = 20
 
-# ---- Tuning knobs (edit as you like) ----
-CHAIN_DEFAULT = "solana"
-
-MIN_LIQ_USD = float(os.getenv("MIN_LIQ_USD", "20000"))          # filter rugs
-MIN_VOL24_USD = float(os.getenv("MIN_VOL24_USD", "50000"))      # filter dead
-MAX_FDV_LIQ = float(os.getenv("MAX_FDV_LIQ", "500"))            # extreme overvaluation cap
-SCREEN_LIMIT = int(os.getenv("SCREEN_LIMIT", "10"))             # how many results to return
-AUTOSCREEN_MINUTES = int(os.getenv("AUTOSCREEN_MINUTES", "10")) # periodic screening frequency
-
 
 # -------------------------
-# HTTP helpers
+# Helpers
 # -------------------------
 def http_get(url: str, params: Optional[dict] = None) -> Any:
     r = requests.get(url, params=params, timeout=TIMEOUT)
@@ -43,273 +34,145 @@ def fmt_money(x: float) -> str:
     return f"${x:,.0f}"
 
 
-def safe_list(x) -> List[Any]:
-    # Normalize: list | {"data": list} | {"pairs": list} | dict -> []
-    if isinstance(x, list):
-        return x
-    if isinstance(x, dict):
-        if isinstance(x.get("data"), list):
-            return x["data"]
-        if isinstance(x.get("pairs"), list):
-            return x["pairs"]
-    return []
+def short(s: str, n: int = 160) -> str:
+    if not s:
+        return ""
+    s = str(s)
+    return s if len(s) <= n else s[: n - 1] + "…"
 
 
-# -------------------------
-# DexScreener endpoints
-# -------------------------
-def ds_search(q: str) -> Dict[str, Any]:
-    return http_get(f"{BASE}/latest/dex/search", params={"q": q})
+def is_probably_address(s: str) -> bool:
+    # Rough: base58-ish length check for Solana token addresses (not perfect; good enough for UX).
+    return bool(re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{32,44}", s))
 
 
-def ds_token_pools(chain_id: str, token_address: str) -> List[Dict[str, Any]]:
-    # returns list (usually), but normalize anyway
-    data = http_get(f"{BASE}/token-pairs/v1/{chain_id}/{token_address}")
-    return safe_list(data)
-
-
-def ds_pairs(chain_id: str, pair_id: str) -> Dict[str, Any]:
-    return http_get(f"{BASE}/latest/dex/pairs/{chain_id}/{pair_id}")
-
-
-def ds_boosts_latest() -> List[Dict[str, Any]]:
-    return safe_list(http_get(f"{BASE}/token-boosts/latest/v1"))
-
-
-def ds_boosts_top() -> List[Dict[str, Any]]:
-    return safe_list(http_get(f"{BASE}/token-boosts/top/v1"))
-
-
-def ds_profiles_latest() -> List[Dict[str, Any]]:
-    return safe_list(http_get(f"{BASE}/token-profiles/latest/v1"))
-
-
-def ds_takeovers_latest() -> List[Dict[str, Any]]:
-    return safe_list(http_get(f"{BASE}/community-takeovers/latest/v1"))
-
-
-def ds_ads_latest() -> List[Dict[str, Any]]:
-    return safe_list(http_get(f"{BASE}/ads/latest/v1"))
-
-
-def ds_orders(chain_id: str, token_address: str) -> List[Dict[str, Any]]:
-    data = http_get(f"{BASE}/orders/v1/{chain_id}/{token_address}")
-    return safe_list(data)
-
-
-# -------------------------
-# Analytics
-# -------------------------
-def pick_best_pair(pairs: List[Dict[str, Any]], chain_id: str = CHAIN_DEFAULT) -> Optional[Dict[str, Any]]:
-    pairs = [p for p in pairs if p.get("chainId") == chain_id]
+def pick_best_pair(pairs: List[Dict[str, Any]], chain_id: Optional[str] = "solana") -> Optional[Dict[str, Any]]:
+    if chain_id:
+        pairs = [p for p in pairs if p.get("chainId") == chain_id]
     if not pairs:
         return None
+    # pick highest liquidity USD
     pairs.sort(key=lambda p: to_float((p.get("liquidity") or {}).get("usd")), reverse=True)
     return pairs[0]
 
 
-def age_minutes(pair_created_at: Any) -> Optional[float]:
-    # DexScreener commonly returns milliseconds timestamp
-    ts = to_float(pair_created_at, default=0.0)
-    if ts <= 0:
-        return None
-    # handle seconds vs ms
-    if ts > 10_000_000_000:  # ms
-        ts /= 1000.0
-    return (time.time() - ts) / 60.0
-
-
-def compute_metrics(pair: Dict[str, Any]) -> Dict[str, Any]:
+def risk_score(pair: Dict[str, Any]) -> Tuple[int, str, List[str]]:
+    """
+    Heuristic score 0–100 (NOT a trading signal).
+    Higher = generally healthier market structure (liquidity/activity).
+    """
     liq = to_float((pair.get("liquidity") or {}).get("usd"))
     vol24 = to_float((pair.get("volume") or {}).get("h24"))
-    fdv = to_float(pair.get("fdv"), default=0.0)
+    fdv = to_float(pair.get("fdv"), 0.0)
+    chg5m = to_float((pair.get("priceChange") or {}).get("m5"))
+    chg1h = to_float((pair.get("priceChange") or {}).get("h1"))
 
-    chg = pair.get("priceChange") or {}
-    chg5m = to_float(chg.get("m5"))
-    chg1h = to_float(chg.get("h1"))
-    chg24 = to_float(chg.get("h24"))
-
-    v_liq = (vol24 / liq) if liq > 0 else 0.0
-    fdv_liq = (fdv / liq) if (liq > 0 and fdv > 0) else 0.0
-
-    age_m = age_minutes(pair.get("pairCreatedAt"))
-
-    flags = []
-    if liq < MIN_LIQ_USD:
-        flags.append("Very low liquidity")
-    if vol24 < MIN_VOL24_USD:
-        flags.append("Low 24h volume")
-    if fdv_liq and fdv_liq > 200:
-        flags.append("FDV high vs liquidity")
-    if fdv_liq and fdv_liq > 500:
-        flags.append("FDV extreme vs liquidity")
-
-    # Pump/dump pressure flags
-    if (chg5m >= 15 and chg1h >= 30 and liq < 50_000):
-        flags.append("Likely coordinated pump risk")
-    if (chg5m <= -15 or chg1h <= -30):
-        flags.append("Sharp dump risk")
-
-    # Age flags
-    if age_m is not None:
-        if age_m < 60:
-            flags.append("Ultra-new (<1h)")
-        elif age_m < 24 * 60:
-            flags.append("New (<24h)")
-
-    # Score (0–100): health heuristic
     score = 50
-    if liq >= 200_000: score += 20
-    elif liq >= 50_000: score += 10
-    elif liq < 20_000: score -= 15
+    reasons: List[str] = []
 
-    if v_liq >= 2.0: score += 10
-    elif v_liq >= 0.5: score += 5
-    elif v_liq < 0.1: score -= 5
+    # Liquidity
+    if liq >= 200_000:
+        score += 20; reasons.append("Strong liquidity")
+    elif liq >= 50_000:
+        score += 10; reasons.append("Decent liquidity")
+    elif liq >= 20_000:
+        reasons.append("Low liquidity")
+    else:
+        score -= 15; reasons.append("Very low liquidity")
 
-    if fdv_liq >= 500: score -= 10
-    elif fdv_liq >= 200: score -= 5
+    # Volume vs liquidity
+    if liq > 0:
+        v_ratio = vol24 / liq
+        if v_ratio >= 2.0:
+            score += 10; reasons.append("Very high activity vs liquidity")
+        elif v_ratio >= 0.5:
+            score += 5; reasons.append("Healthy activity")
+        elif v_ratio < 0.1:
+            score -= 5; reasons.append("Weak activity")
+    else:
+        score -= 10; reasons.append("No liquidity data")
 
-    if chg5m >= 20 or chg1h >= 50: score -= 5
-    if chg5m <= -20 or chg1h <= -50: score -= 5
+    # FDV vs liquidity (rough)
+    if liq > 0 and fdv > 0:
+        fdv_liq = fdv / liq
+        if fdv_liq >= 500:
+            score -= 10; reasons.append("FDV extremely high vs liquidity")
+        elif fdv_liq >= 200:
+            score -= 5; reasons.append("FDV high vs liquidity")
+
+    # Sudden moves
+    if chg5m >= 20 or chg1h >= 50:
+        score -= 5; reasons.append("Sharp pump risk")
+    if chg5m <= -20 or chg1h <= -50:
+        score -= 5; reasons.append("Sharp dump risk")
 
     score = max(0, min(100, score))
     label = "LOW RISK (relative)" if score >= 70 else "MODERATE RISK" if score >= 50 else "HIGH RISK"
-
-    return {
-        "liq": liq,
-        "vol24": vol24,
-        "fdv": fdv,
-        "chg5m": chg5m,
-        "chg1h": chg1h,
-        "chg24": chg24,
-        "v_liq": v_liq,
-        "fdv_liq": fdv_liq,
-        "age_m": age_m,
-        "flags": flags,
-        "score": score,
-        "label": label,
-    }
-
-
-def candidate_passes(m: Dict[str, Any]) -> bool:
-    # Screening filters (you can relax/tighten)
-    if m["liq"] < MIN_LIQ_USD:
-        return False
-    if m["vol24"] < MIN_VOL24_USD:
-        return False
-    if m["fdv_liq"] and m["fdv_liq"] > MAX_FDV_LIQ:
-        return False
-    return True
+    return score, label, reasons
 
 
 # -------------------------
-# Screening engine
+# DexScreener endpoints (from reference)
 # -------------------------
-def fetch_boost_candidates(chain_id: str = CHAIN_DEFAULT) -> List[Dict[str, Any]]:
-    # Combine boosted lists
-    latest = ds_boosts_latest()
-    top = ds_boosts_top()
-
-    # Token boosts objects typically include chainId + tokenAddress
-    raw = latest + top
-
-    # Keep unique tokens on the chain
-    seen = set()
-    tokens = []
-    for it in raw:
-        c = it.get("chainId")
-        addr = it.get("tokenAddress")
-        if not c or not addr:
-            continue
-        if c != chain_id:
-            continue
-        key = (c, addr)
-        if key in seen:
-            continue
-        seen.add(key)
-        tokens.append(it)
-
-    return tokens
+def ds_search(q: str) -> Dict[str, Any]:
+    return http_get(f"{BASE}/latest/dex/search", params={"q": q})  # :contentReference[oaicite:1]{index=1}
 
 
-def screen_tokens(chain_id: str = CHAIN_DEFAULT, limit: int = SCREEN_LIMIT) -> List[Dict[str, Any]]:
-    candidates = fetch_boost_candidates(chain_id)
-
-    scored = []
-    for t in candidates:
-        token_addr = t["tokenAddress"]
-
-        pools = ds_token_pools(chain_id, token_addr)
-        best = pick_best_pair(pools, chain_id)
-        if not best:
-            continue
-
-        m = compute_metrics(best)
-
-        # Boost manipulation flag: boosted + low liquidity
-        if m["liq"] < 40_000:
-            m["flags"].append("Boost + low liquidity (marketing pump risk)")
-
-        if not candidate_passes(m):
-            continue
-
-        scored.append({
-            "tokenAddress": token_addr,
-            "pair": best,
-            "m": m
-        })
-
-    # Rank: score desc, then liquidity desc
-    scored.sort(key=lambda x: (x["m"]["score"], x["m"]["liq"]), reverse=True)
-    return scored[:limit]
+def ds_pairs(chain_id: str, pair_id: str) -> Dict[str, Any]:
+    return http_get(f"{BASE}/latest/dex/pairs/{chain_id}/{pair_id}")  # :contentReference[oaicite:2]{index=2}
 
 
-def format_candidate(item: Dict[str, Any], idx: int) -> str:
-    p = item["pair"]
-    m = item["m"]
-    base = (p.get("baseToken") or {}).get("symbol", "UNK")
-    name = (p.get("baseToken") or {}).get("name", "Unknown")
-    url = p.get("url", "")
-    age_txt = "N/A"
-    if m["age_m"] is not None:
-        mins = m["age_m"]
-        if mins < 120:
-            age_txt = f"{mins:.0f}m"
-        elif mins < 48*60:
-            age_txt = f"{mins/60:.1f}h"
-        else:
-            age_txt = f"{mins/1440:.1f}d"
+def ds_token_pools(chain_id: str, token_address: str) -> List[Dict[str, Any]]:
+    return http_get(f"{BASE}/token-pairs/v1/{chain_id}/{token_address}")  # :contentReference[oaicite:3]{index=3}
 
-    flags = ""
-    if m["flags"]:
-        flags = " | ⚠️ " + "; ".join(m["flags"][:3])
 
-    return (
-        f"{idx}. {name} ({base})\n"
-        f"Score: {m['score']}/100 ({m['label']}) | Age: {age_txt}\n"
-        f"Liq: {fmt_money(m['liq'])} | Vol24: {fmt_money(m['vol24'])}\n"
-        f"FDV/Liq: {m['fdv_liq']:.1f} | Vol/Liq: {m['v_liq']:.2f} | "
-        f"Δ5m {m['chg5m']:.1f}% Δ1h {m['chg1h']:.1f}% Δ24h {m['chg24']:.1f}%"
-        f"{flags}\n"
-        f"{url}"
-    )
+def ds_tokens_batch(chain_id: str, token_addresses_csv: str) -> List[Dict[str, Any]]:
+    return http_get(f"{BASE}/tokens/v1/{chain_id}/{token_addresses_csv}")  # :contentReference[oaicite:4]{index=4}
+
+
+def ds_profiles_latest() -> List[Dict[str, Any]]:
+    return http_get(f"{BASE}/token-profiles/latest/v1")  # :contentReference[oaicite:5]{index=5}
+
+
+def ds_takeovers_latest() -> List[Dict[str, Any]]:
+    return http_get(f"{BASE}/community-takeovers/latest/v1")  # :contentReference[oaicite:6]{index=6}
+
+
+def ds_ads_latest() -> List[Dict[str, Any]]:
+    return http_get(f"{BASE}/ads/latest/v1")  # :contentReference[oaicite:7]{index=7}
+
+
+def ds_boosts_latest() -> List[Dict[str, Any]]:
+    return http_get(f"{BASE}/token-boosts/latest/v1")  # :contentReference[oaicite:8]{index=8}
+
+
+def ds_boosts_top() -> List[Dict[str, Any]]:
+    return http_get(f"{BASE}/token-boosts/top/v1")  # :contentReference[oaicite:9]{index=9}
+
+
+def ds_orders(chain_id: str, token_address: str) -> List[Dict[str, Any]]:
+    return http_get(f"{BASE}/orders/v1/{chain_id}/{token_address}")  # :contentReference[oaicite:10]{index=10}
 
 
 # -------------------------
-# Telegram handlers
+# Telegram commands
 # -------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Solana DexScreener Analytics Bot\n\n"
+        "DexScreener Bot (Solana-first)\n\n"
         "Core:\n"
         "  /check <symbol|address> [chainId]\n"
         "  /score <symbol|address> [chainId]\n"
         "  /pools <tokenAddress> [chainId]\n"
+        "  /pair <pairId> [chainId]\n"
+        "  /tokens <addr1,addr2,...> [chainId]\n\n"
+        "Discovery/Meta:\n"
+        "  /boosts_latest\n"
+        "  /boosts_top\n"
+        "  /profiles_latest\n"
+        "  /takeovers_latest\n"
+        "  /ads_latest\n"
         "  /orders <tokenAddress> [chainId]\n\n"
-        "Screening:\n"
-        "  /screen [chainId]  -> ranked boosted candidates\n"
-        "  /autoscreen on|off [chainId]\n\n"
         "Tip: addresses are more accurate than symbols."
     )
 
@@ -320,30 +183,31 @@ async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     q = context.args[0].strip()
-    chain = context.args[1].strip() if len(context.args) >= 2 else CHAIN_DEFAULT
+    chain = context.args[1].strip() if len(context.args) >= 2 else "solana"
 
     try:
         data = ds_search(q)
-        best = pick_best_pair(safe_list(data.get("pairs")), chain)
+        best = pick_best_pair(data.get("pairs") or [], chain)
         if not best:
             await update.message.reply_text(f"No pair found for chain '{chain}'.")
             return
-
-        m = compute_metrics(best)
 
         base = (best.get("baseToken") or {}).get("name", "Unknown")
         symbol = (best.get("baseToken") or {}).get("symbol", "")
         dex = best.get("dexId", "N/A")
         price = best.get("priceUsd", "N/A")
+        liq = to_float((best.get("liquidity") or {}).get("usd"))
+        vol24 = to_float((best.get("volume") or {}).get("h24"))
+        fdv = best.get("fdv", "N/A")
         url = best.get("url", "")
 
         msg = (
             f"{base} ({symbol}) [{chain}]\n"
             f"DEX: {dex}\n"
             f"Price: ${price}\n"
-            f"Liquidity: {fmt_money(m['liq'])}\n"
-            f"24h Volume: {fmt_money(m['vol24'])}\n"
-            f"FDV: {best.get('fdv','N/A')}\n"
+            f"Liquidity: {fmt_money(liq)}\n"
+            f"24h Volume: {fmt_money(vol24)}\n"
+            f"FDV: {fdv}\n"
         )
         if url:
             msg += f"\nChart: {url}"
@@ -360,32 +224,37 @@ async def score_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     q = context.args[0].strip()
-    chain = context.args[1].strip() if len(context.args) >= 2 else CHAIN_DEFAULT
+    chain = context.args[1].strip() if len(context.args) >= 2 else "solana"
 
     try:
         data = ds_search(q)
-        best = pick_best_pair(safe_list(data.get("pairs")), chain)
+        best = pick_best_pair(data.get("pairs") or [], chain)
         if not best:
             await update.message.reply_text(f"No pair found for chain '{chain}'.")
             return
 
-        m = compute_metrics(best)
         base = (best.get("baseToken") or {}).get("name", "Unknown")
         symbol = (best.get("baseToken") or {}).get("symbol", "")
-        url = best.get("url", "")
 
-        flags = "\n".join([f"• {f}" for f in m["flags"]]) if m["flags"] else "• None"
+        score, label, reasons = risk_score(best)
+
+        liq = to_float((best.get("liquidity") or {}).get("usd"))
+        vol24 = to_float((best.get("volume") or {}).get("h24"))
+        chg5m = to_float((best.get("priceChange") or {}).get("m5"))
+        chg1h = to_float((best.get("priceChange") or {}).get("h1"))
+        chg24 = to_float((best.get("priceChange") or {}).get("h24"))
+        url = best.get("url", "")
 
         msg = (
             f"{base} ({symbol}) [{chain}]\n"
-            f"Score: {m['score']}/100 — {m['label']}\n\n"
-            f"Liquidity: {fmt_money(m['liq'])}\n"
-            f"24h Volume: {fmt_money(m['vol24'])}\n"
-            f"FDV/Liq: {m['fdv_liq']:.1f}\n"
-            f"Vol/Liq: {m['v_liq']:.2f}\n"
-            f"Change: 5m {m['chg5m']:.1f}% | 1h {m['chg1h']:.1f}% | 24h {m['chg24']:.1f}%\n\n"
-            f"Flags:\n{flags}"
+            f"Score: {score}/100 — {label}\n"
+            f"(Heuristic health check, not financial advice)\n\n"
+            f"Liquidity: {fmt_money(liq)}\n"
+            f"24h Volume: {fmt_money(vol24)}\n"
+            f"Change: 5m {chg5m:.1f}% | 1h {chg1h:.1f}% | 24h {chg24:.1f}%\n"
         )
+        if reasons:
+            msg += "\nReasons:\n" + "\n".join([f"• {r}" for r in reasons])
         if url:
             msg += f"\n\nChart: {url}"
 
@@ -401,7 +270,7 @@ async def pools(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     token = context.args[0].strip()
-    chain = context.args[1].strip() if len(context.args) >= 2 else CHAIN_DEFAULT
+    chain = context.args[1].strip() if len(context.args) >= 2 else "solana"
 
     try:
         items = ds_token_pools(chain, token)
@@ -409,6 +278,7 @@ async def pools(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("No pools found.")
             return
 
+        # top 5 by liquidity
         items.sort(key=lambda p: to_float((p.get("liquidity") or {}).get("usd")), reverse=True)
         top = items[:5]
 
@@ -429,27 +299,72 @@ async def pools(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Error: {e}")
 
 
-async def orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def pair(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("Usage: /orders <tokenAddress> [chainId]")
+        await update.message.reply_text("Usage: /pair <pairId> [chainId]")
         return
 
-    token = context.args[0].strip()
-    chain = context.args[1].strip() if len(context.args) >= 2 else CHAIN_DEFAULT
+    pair_id = context.args[0].strip()
+    chain = context.args[1].strip() if len(context.args) >= 2 else "solana"
 
     try:
-        items = ds_orders(chain, token)
-        if not items:
-            await update.message.reply_text("No paid orders found.")
+        data = ds_pairs(chain, pair_id)
+        pairs = data.get("pairs") or []
+        if not pairs:
+            await update.message.reply_text("Pair not found.")
             return
 
-        lines = [f"Orders for {token} [{chain}] (preview):"]
-        for it in items[: min(8, len(items))]:
-            if not isinstance(it, dict):
-                continue
-            lines.append(
-                f"• type={it.get('type')} | status={it.get('status')} | paymentTs={it.get('paymentTimestamp')}"
-            )
+        p = pairs[0]
+        base = (p.get("baseToken") or {}).get("name", "Unknown")
+        symbol = (p.get("baseToken") or {}).get("symbol", "")
+        dex = p.get("dexId", "N/A")
+        price = p.get("priceUsd", "N/A")
+        liq = to_float((p.get("liquidity") or {}).get("usd"))
+        vol24 = to_float((p.get("volume") or {}).get("h24"))
+        url = p.get("url", "")
+
+        msg = (
+            f"Pair lookup [{chain}]\n"
+            f"{base} ({symbol})\n"
+            f"DEX: {dex}\n"
+            f"Price: ${price}\n"
+            f"Liquidity: {fmt_money(liq)}\n"
+            f"24h Volume: {fmt_money(vol24)}\n"
+        )
+        if url:
+            msg += f"\nChart: {url}"
+
+        await update.message.reply_text(msg)
+
+    except Exception as e:
+        await update.message.reply_text(f"Error: {e}")
+
+
+async def tokens(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /tokens <addr1,addr2,...> [chainId]  (max 30 addresses)")
+        return
+
+    addrs = context.args[0].strip()
+    chain = context.args[1].strip() if len(context.args) >= 2 else "solana"
+
+    try:
+        items = ds_tokens_batch(chain, addrs)
+        if not items:
+            await update.message.reply_text("No results.")
+            return
+
+        # show top 10 by liquidity
+        items.sort(key=lambda p: to_float((p.get("liquidity") or {}).get("usd")), reverse=True)
+        top = items[:10]
+
+        lines = [f"Tokens batch [{chain}] (top 10 by liquidity):"]
+        for p in top:
+            base = (p.get("baseToken") or {}).get("symbol", "UNK")
+            liq = to_float((p.get("liquidity") or {}).get("usd"))
+            price = p.get("priceUsd", "N/A")
+            pair_addr = p.get("pairAddress", "N/A")
+            lines.append(f"• {base} | price ${price} | liq {fmt_money(liq)} | pair {pair_addr}")
 
         await update.message.reply_text("\n".join(lines))
 
@@ -457,80 +372,95 @@ async def orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Error: {e}")
 
 
-async def screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chain = context.args[0].strip() if context.args else CHAIN_DEFAULT
+def _list_preview(items: List[Dict[str, Any]], title: str, n: int = 8) -> str:
+    lines = [title]
+    for it in items[:n]:
+        chain = it.get("chainId", "")
+        addr = it.get("tokenAddress", "")
+        amount = it.get("amount")
+        total = it.get("totalAmount")
+        typ = it.get("type")
+        date = it.get("date") or it.get("claimDate")
+        url = it.get("url", "")
 
+        bits = []
+        if chain: bits.append(chain)
+        if addr: bits.append(addr)
+        if typ: bits.append(f"type={typ}")
+        if date: bits.append(f"date={date}")
+        if amount is not None: bits.append(f"amt={amount}")
+        if total is not None: bits.append(f"total={total}")
+
+        line = "• " + " | ".join(bits)
+        lines.append(line)
+        if url:
+            lines.append(f"  {url}")
+    return "\n".join(lines)
+
+
+async def boosts_latest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        results = screen_tokens(chain_id=chain, limit=SCREEN_LIMIT)
-        if not results:
-            await update.message.reply_text(
-                f"No candidates met filters.\n"
-                f"(Try lowering MIN_LIQ_USD / MIN_VOL24_USD or raising MAX_FDV_LIQ.)"
-            )
-            return
-
-        msg_parts = [f"Screen results [{chain}] (filters: liq≥{fmt_money(MIN_LIQ_USD)}, vol24≥{fmt_money(MIN_VOL24_USD)}, fdv/liq≤{MAX_FDV_LIQ})\n"]
-        for i, item in enumerate(results, start=1):
-            msg_parts.append(format_candidate(item, i))
-            msg_parts.append("")  # spacer
-
-        await update.message.reply_text("\n".join(msg_parts[: 1 + (SCREEN_LIMIT * 5)]))
-
+        items = ds_boosts_latest()
+        await update.message.reply_text(_list_preview(items, "Latest boosted tokens (preview):"))
     except Exception as e:
         await update.message.reply_text(f"Error: {e}")
 
 
-# ---- Auto-screen scheduling (per chat) ----
-AUTOSCREEN_JOBS: Dict[int, Any] = {}
+async def boosts_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        items = ds_boosts_top()
+        await update.message.reply_text(_list_preview(items, "Top boosted tokens (preview):"))
+    except Exception as e:
+        await update.message.reply_text(f"Error: {e}")
 
-async def autoscreen(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args or context.args[0].lower() not in ("on", "off"):
-        await update.message.reply_text("Usage: /autoscreen on|off [chainId]")
+
+async def profiles_latest(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        items = ds_profiles_latest()
+        await update.message.reply_text(_list_preview(items, "Latest token profiles (preview):"))
+    except Exception as e:
+        await update.message.reply_text(f"Error: {e}")
+
+
+async def takeovers_latest(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        items = ds_takeovers_latest()
+        await update.message.reply_text(_list_preview(items, "Latest community takeovers (preview):"))
+    except Exception as e:
+        await update.message.reply_text(f"Error: {e}")
+
+
+async def ads_latest(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        items = ds_ads_latest()
+        await update.message.reply_text(_list_preview(items, "Latest ads (preview):"))
+    except Exception as e:
+        await update.message.reply_text(f"Error: {e}")
+
+
+async def orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /orders <tokenAddress> [chainId]")
         return
 
-    mode = context.args[0].lower()
-    chain = context.args[1].strip() if len(context.args) >= 2 else CHAIN_DEFAULT
-    chat_id = update.effective_chat.id
+    token = context.args[0].strip()
+    chain = context.args[1].strip() if len(context.args) >= 2 else "solana"
 
-    if mode == "off":
-        job = AUTOSCREEN_JOBS.pop(chat_id, None)
-        if job:
-            job.schedule_removal()
-        await update.message.reply_text("Auto-screen disabled.")
-        return
-
-    # mode == on
-    if chat_id in AUTOSCREEN_JOBS:
-        await update.message.reply_text("Auto-screen is already ON.")
-        return
-
-    async def job_callback(ctx: ContextTypes.DEFAULT_TYPE):
-        try:
-            results = screen_tokens(chain_id=chain, limit=min(5, SCREEN_LIMIT))
-            if not results:
-                return
-            lines = [f"Auto-screen [{chain}] top picks (heuristic):"]
-            for i, item in enumerate(results, start=1):
-                p = item["pair"]
-                m = item["m"]
-                sym = (p.get("baseToken") or {}).get("symbol", "UNK")
-                url = p.get("url", "")
-                flags = "; ".join(m["flags"][:2]) if m["flags"] else "no major flags"
-                lines.append(
-                    f"{i}) {sym} | score {m['score']}/100 | liq {fmt_money(m['liq'])} | vol24 {fmt_money(m['vol24'])} | {flags}\n{url}"
-                )
-            await ctx.bot.send_message(chat_id=chat_id, text="\n".join(lines))
-        except Exception:
-            # keep silent; avoid spamming errors
+    try:
+        items = ds_orders(chain, token)
+        if not items:
+            await update.message.reply_text("No paid orders found (or none returned).")
             return
+        # preview a few orders
+        lines = [f"Orders for {token} [{chain}] (preview):"]
+        for it in items[:8]:
+            lines.append(
+                f"• type={it.get('type')} | status={it.get('status')} | paymentTs={it.get('paymentTimestamp')}"
+            )
+        await update.message.reply_text("\n".join(lines))
 
-    job = context.job_queue.run_repeating(job_callback, interval=AUTOSCREEN_MINUTES * 60, first=5)
-    AUTOSCREEN_JOBS[chat_id] = job
-
-    await update.message.reply_text(
-        f"Auto-screen enabled: every {AUTOSCREEN_MINUTES} minutes on [{chain}].\n"
-        f"Use /autoscreen off to stop."
-    )
+    except Exception as e:
+        await update.message.reply_text(f"Error: {e}")
 
 
 def main():
@@ -543,9 +473,15 @@ def main():
     app.add_handler(CommandHandler("check", check))
     app.add_handler(CommandHandler("score", score_cmd))
     app.add_handler(CommandHandler("pools", pools))
+    app.add_handler(CommandHandler("pair", pair))
+    app.add_handler(CommandHandler("tokens", tokens))
+
+    app.add_handler(CommandHandler("boosts_latest", boosts_latest))
+    app.add_handler(CommandHandler("boosts_top", boosts_top))
+    app.add_handler(CommandHandler("profiles_latest", profiles_latest))
+    app.add_handler(CommandHandler("takeovers_latest", takeovers_latest))
+    app.add_handler(CommandHandler("ads_latest", ads_latest))
     app.add_handler(CommandHandler("orders", orders))
-    app.add_handler(CommandHandler("screen", screen))
-    app.add_handler(CommandHandler("autoscreen", autoscreen))
 
     print("Bot is running...")
     app.run_polling()
