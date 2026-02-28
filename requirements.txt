@@ -1,3 +1,4 @@
-python-telegram-bot==20.3
+python-telegram-bot[job-queue]==20.3
+APScheduler==3.10.4
 requests
 python-dateutil
