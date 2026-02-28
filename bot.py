@@ -373,16 +373,26 @@ async def tokens(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def _list_preview(items, title: str, n: int = 8) -> str:
-    if isinstance(items, dict):
-        # Some endpoints return dict with nested data
-        items = items.get("data") or items.get("pairs") or []
+    # Normalize response structure safely
 
+    if isinstance(items, dict):
+        # Try common container keys
+        if "data" in items:
+            items = items["data"]
+        elif "pairs" in items:
+            items = items["pairs"]
+        else:
+            # If dict but not structured as expected, wrap it
+            items = [items]
+
+    # If still not list, force into list
     if not isinstance(items, list):
-        return f"{title}\n(No list data returned)"
+        items = [items]
 
     lines = [title]
 
-    for it in items[:n]:
+    # Safe slicing
+    for it in items[: min(n, len(items))]:
         if not isinstance(it, dict):
             continue
 
@@ -393,17 +403,21 @@ def _list_preview(items, title: str, n: int = 8) -> str:
         url = it.get("url", "")
 
         bits = []
-        if chain: bits.append(chain)
-        if addr: bits.append(addr)
-        if typ: bits.append(f"type={typ}")
-        if date: bits.append(f"date={date}")
+        if chain:
+            bits.append(chain)
+        if addr:
+            bits.append(addr)
+        if typ:
+            bits.append(f"type={typ}")
+        if date:
+            bits.append(f"date={date}")
 
         lines.append("• " + " | ".join(bits))
+
         if url:
             lines.append(f"  {url}")
 
     return "\n".join(lines)
-
 async def boosts_latest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         items = ds_boosts_latest()
