@@ -3,7 +3,7 @@ import requests
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-BOT_TOKEN = os.getenv("8632182947:AAEZf_4ku452RgFF6EyucbJTQOmiJuqCUD0")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -30,7 +30,7 @@ async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(message)
 
-app = ApplicationBuilder().token(8632182947:AAEZf_4ku452RgFF6EyucbJTQOmiJuqCUD0).build()
+app = ApplicationBuilder().token(BOT_TOKEN).build()
 app.add_handler(CommandHandler("check", check))
 
 print("Bot is running...")
