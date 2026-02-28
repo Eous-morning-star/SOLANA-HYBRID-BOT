@@ -372,15 +372,24 @@ async def tokens(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Error: {e}")
 
 
-def _list_preview(items: List[Dict[str, Any]], title: str, n: int = 8) -> str:
+def _list_preview(items, title: str, n: int = 8) -> str:
+    if isinstance(items, dict):
+        # Some endpoints return dict with nested data
+        items = items.get("data") or items.get("pairs") or []
+
+    if not isinstance(items, list):
+        return f"{title}\n(No list data returned)"
+
     lines = [title]
+
     for it in items[:n]:
+        if not isinstance(it, dict):
+            continue
+
         chain = it.get("chainId", "")
         addr = it.get("tokenAddress", "")
-        amount = it.get("amount")
-        total = it.get("totalAmount")
-        typ = it.get("type")
-        date = it.get("date") or it.get("claimDate")
+        typ = it.get("type", "")
+        date = it.get("date") or it.get("claimDate") or ""
         url = it.get("url", "")
 
         bits = []
@@ -388,15 +397,12 @@ def _list_preview(items: List[Dict[str, Any]], title: str, n: int = 8) -> str:
         if addr: bits.append(addr)
         if typ: bits.append(f"type={typ}")
         if date: bits.append(f"date={date}")
-        if amount is not None: bits.append(f"amt={amount}")
-        if total is not None: bits.append(f"total={total}")
 
-        line = "• " + " | ".join(bits)
-        lines.append(line)
+        lines.append("• " + " | ".join(bits))
         if url:
             lines.append(f"  {url}")
-    return "\n".join(lines)
 
+    return "\n".join(lines)
 
 async def boosts_latest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
