@@ -17,8 +17,8 @@ CHAIN_DEFAULT = "solana"
 MIN_LIQ_USD = float(os.getenv("MIN_LIQ_USD", "20000"))          # filter rugs
 MIN_VOL24_USD = float(os.getenv("MIN_VOL24_USD", "50000"))      # filter dead
 MAX_FDV_LIQ = float(os.getenv("MAX_FDV_LIQ", "500"))            # extreme overvaluation cap
-SCREEN_LIMIT = int(os.getenv("SCREEN_LIMIT", "25"))             # how many results to return
-AUTOSCREEN_MINUTES = int(os.getenv("AUTOSCREEN_MINUTES", "2")) # periodic screening frequency
+SCREEN_LIMIT = int(os.getenv("SCREEN_LIMIT", "10"))             # how many results to return
+AUTOSCREEN_MINUTES = int(os.getenv("AUTOSCREEN_MINUTES", "10")) # periodic screening frequency
 
 
 # -------------------------
