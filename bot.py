@@ -149,7 +149,57 @@ def ds_boosts_latest() -> List[Dict[str, Any]]:
 def ds_boosts_top() -> List[Dict[str, Any]]:
     return http_get(f"{BASE}/token-boosts/top/v1")  # :contentReference[oaicite:9]{index=9}
 
+def screen_tokens(chain_id: str = "solana", limit: int = 10) -> List[Dict[str, Any]]:
+    boosted = ds_boosts_latest()
 
+    if not isinstance(boosted, list):
+        return []
+
+    candidates = []
+
+    for item in boosted:
+        if not isinstance(item, dict):
+            continue
+
+        if item.get("chainId") != chain_id:
+            continue
+
+        token_addr = item.get("tokenAddress")
+        if not token_addr:
+            continue
+
+        try:
+            pools = ds_token_pools(chain_id, token_addr)
+            if not isinstance(pools, list):
+                continue
+
+            best = pick_best_pair(pools, chain_id)
+            if not best:
+                continue
+
+            score, label, reasons = risk_score(best)
+
+            candidates.append({
+                "pair": best,
+                "score": score,
+                "label": label,
+                "reasons": reasons
+            })
+
+        except Exception:
+            continue
+
+    # sort by score then liquidity
+    candidates.sort(
+        key=lambda x: (
+            x["score"],
+            to_float((x["pair"].get("liquidity") or {}).get("usd"))
+        ),
+        reverse=True
+    )
+
+    return candidates[:limit]
+    
 def ds_orders(chain_id: str, token_address: str):
     data = http_get(f"{BASE}/orders/v1/{chain_id}/{token_address}")
 
@@ -501,6 +551,42 @@ async def orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"Error: {e}")
 
+async def screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chain = context.args[0].strip() if context.args else "solana"
+
+    try:
+        results = screen_tokens(chain_id=chain, limit=10)
+
+        if not results:
+            await update.message.reply_text("No candidates found.")
+            return
+
+        lines = [f"Screen Results [{chain}] (boosted tokens):\n"]
+
+        for idx, item in enumerate(results, start=1):
+            p = item["pair"]
+            base = (p.get("baseToken") or {}).get("symbol", "UNK")
+            name = (p.get("baseToken") or {}).get("name", "Unknown")
+            liq = to_float((p.get("liquidity") or {}).get("usd"))
+            vol24 = to_float((p.get("volume") or {}).get("h24"))
+            url = p.get("url", "")
+
+            lines.append(
+                f"{idx}) {name} ({base})\n"
+                f"Score: {item['score']}/100 — {item['label']}\n"
+                f"Liq: {fmt_money(liq)} | Vol24: {fmt_money(vol24)}"
+            )
+
+            if url:
+                lines.append(url)
+
+            lines.append("")
+
+        await update.message.reply_text("\n".join(lines))
+
+    except Exception as e:
+        await update.message.reply_text(f"Error: {e}")
+        
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is missing. Add it in Railway Variables.")
@@ -513,6 +599,7 @@ def main():
     app.add_handler(CommandHandler("pools", pools))
     app.add_handler(CommandHandler("pair", pair))
     app.add_handler(CommandHandler("tokens", tokens))
+    app.add_handler(CommandHandler("screen", screen))
 
     app.add_handler(CommandHandler("boosts_latest", boosts_latest))
     app.add_handler(CommandHandler("boosts_top", boosts_top))
