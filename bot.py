@@ -11,6 +11,85 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 BASE = "https://api.dexscreener.com"
 TIMEOUT = 20
 
+HELIUS_API_KEY = os.getenv("HELIUS_API_KEY")
+
+MAX_SINGLE_HOLDER_PCT = float(os.getenv("MAX_SINGLE_HOLDER_PCT", "7.0"))
+MAX_TOP3_PCT = float(os.getenv("MAX_TOP3_PCT", "25.0"))
+MAX_TOP10_PCT = float(os.getenv("MAX_TOP10_PCT", "60.0"))
+MIN_AGE_HOURS = float(os.getenv("MIN_AGE_HOURS", "36.0"))
+
+HELIUS_RPC_URL = "https://mainnet.helius-rpc.com/?api-key="
+
+def helius_rpc(method: str, params: list):
+    if not HELIUS_API_KEY:
+        raise RuntimeError("HELIUS_API_KEY is missing in Railway Variables.")
+    url = f"{HELIUS_RPC_URL}{HELIUS_API_KEY}"
+    payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+    r = requests.post(url, json=payload, timeout=TIMEOUT)
+    r.raise_for_status()
+    j = r.json()
+    if "error" in j:
+        raise RuntimeError(j["error"])
+    return j.get("result")
+
+def get_supply_ui(mint: str) -> float:
+    res = helius_rpc("getTokenSupply", [mint, {"commitment": "confirmed"}])
+    val = (res or {}).get("value", {})
+    amount = float(val.get("amount", "0"))
+    decimals = int(val.get("decimals", 0))
+    return amount / (10 ** decimals) if decimals >= 0 else 0.0
+
+def holder_concentration(mint: str) -> dict:
+    """
+    Returns single/top3/top10 percentages based on token accounts (not perfect per-wallet,
+    but strong enough for screening).
+    """
+    res = helius_rpc("getTokenLargestAccounts", [mint, {"commitment": "confirmed"}])
+    supply = get_supply_ui(mint)
+    if supply <= 0:
+        return {"single": 0.0, "top3": 0.0, "top10": 0.0}
+
+    arr = (res or {}).get("value", []) or []
+    amounts = []
+    for it in arr[:10]:
+        try:
+            amounts.append(float(it.get("amount", "0")))
+        except Exception:
+            amounts.append(0.0)
+
+    single = (amounts[0] / supply * 100.0) if amounts else 0.0
+    top3 = (sum(amounts[:3]) / supply * 100.0) if len(amounts) >= 3 else single
+    top10 = (sum(amounts[:10]) / supply * 100.0) if amounts else single
+
+    return {"single": single, "top3": top3, "top10": top10}
+
+def token_authorities(mint: str) -> dict:
+    """
+    Checks mint + freeze authority. If either exists, token can be manipulated more easily.
+    """
+    res = helius_rpc("getAccountInfo", [mint, {"encoding": "jsonParsed", "commitment": "confirmed"}])
+    value = (res or {}).get("value")
+    if not value:
+        return {"mintAuthority": None, "freezeAuthority": None}
+
+    parsed = (((value.get("data") or {}).get("parsed") or {}).get("info") or {})
+    # For SPL Token mints, these keys typically exist in jsonParsed
+    return {
+        "mintAuthority": parsed.get("mintAuthority"),
+        "freezeAuthority": parsed.get("freezeAuthority"),
+    }
+
+def age_ok(pair: dict) -> tuple[bool, str]:
+    # Uses DexScreener pairCreatedAt (ms or sec). Enforces >= MIN_AGE_HOURS.
+    ts = to_float(pair.get("pairCreatedAt"), 0.0)
+    if ts <= 0:
+        return False, "Missing age data"
+    if ts > 10_000_000_000:  # ms -> sec
+        ts /= 1000.0
+    age_hours = (time.time() - ts) / 3600.0
+    if age_hours < MIN_AGE_HOURS:
+        return False, f"Too new ({age_hours:.1f}h < {MIN_AGE_HOURS:.0f}h)"
+    return True, f"{age_hours:.1f}h"
 
 # -------------------------
 # Helpers
@@ -213,7 +292,85 @@ def ds_orders(chain_id: str, token_address: str):
         return []
 
     return []
+    
+def screen_tokens(chain_id: str = "solana", limit: int = 10) -> List[Dict[str, Any]]:
+    boosted = ds_boosts_latest()
+    if not isinstance(boosted, list):
+        return []
 
+    seen = set()
+    candidates: List[Dict[str, Any]] = []
+
+    for item in boosted:
+        if not isinstance(item, dict):
+            continue
+        if item.get("chainId") != chain_id:
+            continue
+
+        token_addr = item.get("tokenAddress")
+        if not token_addr or token_addr in seen:
+            continue
+        seen.add(token_addr)
+
+        try:
+            pools = ds_token_pools(chain_id, token_addr)
+            if not isinstance(pools, list) or not pools:
+                continue
+
+            best = pick_best_pair(pools, chain_id)
+            if not best:
+                continue
+
+            # ✅ AGE FILTER: >= 36 hours (or MIN_AGE_HOURS)
+            ok, age_info = age_ok(best)
+            if not ok:
+                continue
+
+            # Identify mint (DexScreener base token address)
+            mint = ((best.get("baseToken") or {}).get("address")) or token_addr
+
+            # ✅ HOLDER CONCENTRATION (Helius)
+            hc = holder_concentration(mint)
+            if hc["single"] > MAX_SINGLE_HOLDER_PCT:
+                continue
+            if hc["top3"] > MAX_TOP3_PCT:
+                continue
+            if hc["top10"] > MAX_TOP10_PCT:
+                continue
+
+            # ✅ AUTHORITIES (Helius)
+            auth = token_authorities(mint)
+            # Strict: reject if mint authority exists (can mint more supply)
+            if auth.get("mintAuthority"):
+                continue
+            # Strict: reject if freeze authority exists (can freeze transfers)
+            if auth.get("freezeAuthority"):
+                continue
+
+            score, label, reasons = risk_score(best)
+
+            liq = to_float((best.get("liquidity") or {}).get("usd"))
+            vol24 = to_float((best.get("volume") or {}).get("h24"))
+
+            candidates.append({
+                "pair": best,
+                "mint": mint,
+                "age": age_info,
+                "holders": hc,
+                "auth": auth,
+                "score": score,
+                "label": label,
+                "reasons": reasons,
+                "liq": liq,
+                "vol24": vol24,
+            })
+
+        except Exception:
+            continue
+
+    # Rank by score, then liquidity
+    candidates.sort(key=lambda x: (x["score"], x["liq"]), reverse=True)
+    return candidates[:limit]
 
 # -------------------------
 # Telegram commands
@@ -587,6 +744,40 @@ async def screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"Error: {e}")
         
+async def screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chain = context.args[0].strip() if context.args else "solana"
+
+    try:
+        results = screen_tokens(chain_id=chain, limit=10)
+        if not results:
+            await update.message.reply_text(
+                f"No candidates passed filters.\n"
+                f"Rules: age≥{MIN_AGE_HOURS:.0f}h, single≤{MAX_SINGLE_HOLDER_PCT}%, top3≤{MAX_TOP3_PCT}%, top10≤{MAX_TOP10_PCT}%, no mint/freeze authority."
+            )
+            return
+
+        lines = [f"✅ Screen Results [{chain}] (Top 10)\n"
+                 f"Filters: age≥{MIN_AGE_HOURS:.0f}h | single≤{MAX_SINGLE_HOLDER_PCT}% | top3≤{MAX_TOP3_PCT}% | top10≤{MAX_TOP10_PCT}% | no mint/freeze auth\n"]
+
+        for i, item in enumerate(results, start=1):
+            p = item["pair"]
+            name = (p.get("baseToken") or {}).get("name", "Unknown")
+            sym = (p.get("baseToken") or {}).get("symbol", "UNK")
+            url = p.get("url", "")
+
+            hc = item["holders"]
+            lines.append(
+                f"{i}) {name} ({sym}) | Score {item['score']}/100 ({item['label']}) | Age {item['age']}\n"
+                f"   Liq {fmt_money(item['liq'])} | Vol24 {fmt_money(item['vol24'])}\n"
+                f"   Holders: single {hc['single']:.2f}% | top3 {hc['top3']:.2f}% | top10 {hc['top10']:.2f}%\n"
+                f"{url}"
+            )
+
+        await update.message.reply_text("\n\n".join(lines))
+
+    except Exception as e:
+        await update.message.reply_text(f"Error: {e}")
+        
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is missing. Add it in Railway Variables.")
@@ -599,6 +790,7 @@ def main():
     app.add_handler(CommandHandler("pools", pools))
     app.add_handler(CommandHandler("pair", pair))
     app.add_handler(CommandHandler("tokens", tokens))
+    app.add_handler(CommandHandler("screen", screen))
     app.add_handler(CommandHandler("screen", screen))
 
     app.add_handler(CommandHandler("boosts_latest", boosts_latest))
