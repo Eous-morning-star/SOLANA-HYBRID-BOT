@@ -333,21 +333,32 @@ def screen_tokens(chain_id: str = "solana", limit: int = 10) -> List[Dict[str, A
             hc = holder_concentration(mint)
             if hc["single"] > MAX_SINGLE_HOLDER_PCT:
                 continue
+             SOFT PENALTIES
+            penalty = 0
+            soft_flags = []
+            
             if hc["top3"] > MAX_TOP3_PCT:
-                continue
+                penalty += 5
+                soft_flags.append("High top3 concentration")
+            
             if hc["top10"] > MAX_TOP10_PCT:
-                continue
+                penalty += 5
+                soft_flags.append("High top10 concentration")
 
             # ✅ AUTHORITIES (Helius)
             auth = token_authorities(mint)
             # Strict: reject if mint authority exists (can mint more supply)
+            # HARD REJECT if mint authority exists
             if auth.get("mintAuthority"):
                 continue
-            # Strict: reject if freeze authority exists (can freeze transfers)
+            
+            # SOFT penalty if freeze authority exists
             if auth.get("freezeAuthority"):
-                continue
+                penalty += 5
+                soft_flags.append("Freeze authority enabled")
 
             score, label, reasons = risk_score(best)
+            score = max(0, score - penalty)
 
             liq = to_float((best.get("liquidity") or {}).get("usd"))
             vol24 = to_float((best.get("volume") or {}).get("h24"))
@@ -363,6 +374,7 @@ def screen_tokens(chain_id: str = "solana", limit: int = 10) -> List[Dict[str, A
                 "reasons": reasons,
                 "liq": liq,
                 "vol24": vol24,
+                "soft_flags": soft_flags,    
             })
 
         except Exception:
@@ -772,6 +784,9 @@ async def screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"   Holders: single {hc['single']:.2f}% | top3 {hc['top3']:.2f}% | top10 {hc['top10']:.2f}%\n"
                 f"{url}"
             )
+            
+            if item["soft_flags"]:
+            lines.append("   ⚠️ " + "; ".join(item["soft_flags"]))
 
         await update.message.reply_text("\n\n".join(lines))
 
