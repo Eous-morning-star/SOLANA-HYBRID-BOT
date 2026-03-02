@@ -213,7 +213,28 @@ def ds_orders(chain_id: str, token_address: str):
         return []
 
     return []
+ # -------------------------
+# Binance USD-M Futures
+# -------------------------
 
+FAPI = "https://fapi.binance.com"
+
+def fapi_get(path: str, params: Optional[dict] = None) -> Any:
+    return http_get(f"{FAPI}{path}", params=params)
+
+def fapi_exchange_info() -> Dict[str, Any]:
+    return fapi_get("/fapi/v1/exchangeInfo")
+
+def fapi_ticker_24h(symbol: Optional[str] = None) -> Any:
+    params = {"symbol": symbol} if symbol else None
+    return fapi_get("/fapi/v1/ticker/24hr", params=params)
+
+def fapi_open_interest(symbol: str) -> Dict[str, Any]:
+    return fapi_get("/fapi/v1/openInterest", params={"symbol": symbol})
+
+def fapi_premium_index(symbol: Optional[str] = None) -> Any:
+    params = {"symbol": symbol} if symbol else None
+    return fapi_get("/fapi/v1/premiumIndex", params=params)
 
 # -------------------------
 # Telegram commands
@@ -586,6 +607,133 @@ async def screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         await update.message.reply_text(f"Error: {e}")
+
+import json
+
+SYMBOL_CACHE_FILE = "fapi_symbols.json"
+
+def load_symbol_cache() -> set:
+    try:
+        with open(SYMBOL_CACHE_FILE, "r") as f:
+            return set(json.load(f))
+    except Exception:
+        return set()
+
+def save_symbol_cache(symbols: set) -> None:
+    try:
+        with open(SYMBOL_CACHE_FILE, "w") as f:
+            json.dump(sorted(list(symbols)), f)
+    except Exception:
+        pass
+
+def get_current_futures_symbols() -> set:
+    info = fapi_exchange_info()
+    syms = set()
+    for s in info.get("symbols", []):
+        if s.get("status") == "TRADING":
+            syms.add(s.get("symbol"))
+    return {x for x in syms if x}
+
+
+async def futures_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        current = get_current_futures_symbols()
+        prev = load_symbol_cache()
+
+        new_syms = sorted(list(current - prev))
+        save_symbol_cache(current)
+
+        if not new_syms:
+            await update.message.reply_text("No new Futures symbols detected.")
+            return
+
+        await update.message.reply_text(
+            "🆕 New Binance Futures listings:\n" +
+            "\n".join([f"• {s}" for s in new_syms[:20]])
+        )
+
+    except Exception as e:
+        await update.message.reply_text(f"Error: {e}")
+
+
+def score_symbol(symbol: str) -> Tuple[int, List[str]]:
+    t = fapi_ticker_24h(symbol)
+    oi = fapi_open_interest(symbol)
+    pi = fapi_premium_index(symbol)
+
+    quote_vol = float(t.get("quoteVolume", 0.0))
+    trades = float(t.get("count", 0.0))
+    pct = float(t.get("priceChangePercent", 0.0))
+    funding = float(pi.get("lastFundingRate", 0.0))
+    open_interest = float(oi.get("openInterest", 0.0))
+
+    score = 50
+    reasons = []
+
+    if quote_vol >= 100_000_000:
+        score += 15; reasons.append("Very high volume")
+    elif quote_vol < 5_000_000:
+        score -= 10; reasons.append("Low volume")
+
+    if trades >= 200_000:
+        score += 5; reasons.append("High activity")
+
+    if abs(funding) >= 0.002:
+        score -= 10; reasons.append("Funding extreme (crowded trade)")
+
+    if open_interest >= 50_000_000:
+        score += 5; reasons.append("High open interest")
+
+    score = max(0, min(100, score))
+    return score, reasons
+
+
+async def futures_score(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /futures_score BTCUSDT")
+        return
+
+    symbol = context.args[0].upper().strip()
+
+    try:
+        score, reasons = score_symbol(symbol)
+
+        msg = f"📊 {symbol} Futures Score: {score}/100\n"
+        msg += "\n".join([f"• {r}" for r in reasons])
+        msg += "\n\nHeuristic ranking — not financial advice."
+
+        await update.message.reply_text(msg)
+
+    except Exception as e:
+        await update.message.reply_text(f"Error: {e}")
+
+
+async def futures_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        all_tickers = fapi_ticker_24h()
+
+        ranked = []
+        for t in all_tickers:
+            sym = t.get("symbol")
+            if not sym or not sym.endswith("USDT"):
+                continue
+
+            qv = float(t.get("quoteVolume", 0.0))
+            pct = abs(float(t.get("priceChangePercent", 0.0)))
+
+            ranked.append((qv * (1 + pct/100), sym))
+
+        ranked.sort(reverse=True)
+        top = ranked[:10]
+
+        lines = ["🔥 Top 10 Futures Watchlist:"]
+        for i, (_, sym) in enumerate(top, 1):
+            lines.append(f"{i}) {sym}")
+
+        await update.message.reply_text("\n".join(lines))
+
+    except Exception as e:
+        await update.message.reply_text(f"Error: {e}")
         
 def main():
     if not BOT_TOKEN:
@@ -607,6 +755,9 @@ def main():
     app.add_handler(CommandHandler("takeovers_latest", takeovers_latest))
     app.add_handler(CommandHandler("ads_latest", ads_latest))
     app.add_handler(CommandHandler("orders", orders))
+    app.add_handler(CommandHandler("futures_new", futures_new))
+    app.add_handler(CommandHandler("futures_score", futures_score))
+    app.add_handler(CommandHandler("futures_top", futures_top))
 
     print("Bot is running...")
     app.run_polling()
