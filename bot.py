@@ -236,6 +236,34 @@ def fapi_premium_index(symbol: Optional[str] = None) -> Any:
     params = {"symbol": symbol} if symbol else None
     return fapi_get("/fapi/v1/premiumIndex", params=params)
 
+def build_futures_dataset():
+    tickers = fapi_ticker_24h()
+    funding = fapi_premium_index()
+
+    if not isinstance(tickers, list) or not isinstance(funding, list):
+        return []
+
+    funding_map = {f["symbol"]: f for f in funding if "symbol" in f}
+
+    dataset = []
+
+    for t in tickers:
+        sym = t.get("symbol")
+        if not sym or not sym.endswith("USDT"):
+            continue
+
+        f = funding_map.get(sym, {})
+
+        dataset.append({
+            "symbol": sym,
+            "volume": float(t.get("quoteVolume", 0)),
+            "trades": float(t.get("count", 0)),
+            "pct24": float(t.get("priceChangePercent", 0)),
+            "funding": float(f.get("lastFundingRate", 0))
+        })
+
+    return dataset
+
 # -------------------------
 # Telegram commands
 # -------------------------
@@ -500,6 +528,7 @@ def _list_preview(items, title: str, n: int = 8) -> str:
             lines.append(f"  {url}")
 
     return "\n".join(lines)
+    
 async def boosts_latest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         items = ds_boosts_latest()
@@ -655,7 +684,86 @@ async def futures_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"Error: {e}")
 
+async def intraday_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        data = build_futures_dataset()
 
+        ranked = []
+
+        for d in data:
+            score = 0
+
+            # Momentum bias
+            if d["pct24"] > 5:
+                score += 15
+            elif d["pct24"] < -5:
+                score += 10  # short bias
+
+            # Volume filter
+            if d["volume"] > 50_000_000:
+                score += 15
+
+            # Funding sanity
+            if abs(d["funding"]) < 0.001:
+                score += 10
+            else:
+                score -= 5
+
+            ranked.append((score, d))
+
+        ranked.sort(reverse=True)
+        top = ranked[:10]
+
+        lines = ["📈 INTRADAY MODE — Top 10:"]
+
+        for i, (score, d) in enumerate(top, 1):
+            lines.append(
+                f"{i}) {d['symbol']} | Score {score} | 24h {d['pct24']:.2f}%"
+            )
+
+        await update.message.reply_text("\n".join(lines))
+
+    except Exception as e:
+        await update.message.reply_text(f"Error: {e}")
+
+async def swing_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        data = build_futures_dataset()
+
+        ranked = []
+
+        for d in data:
+            score = 0
+
+            # Stable trend preference
+            if 2 < d["pct24"] < 10:
+                score += 15
+
+            # High participation
+            if d["volume"] > 80_000_000:
+                score += 15
+
+            # Funding neutral preferred
+            if abs(d["funding"]) < 0.0008:
+                score += 10
+
+            ranked.append((score, d))
+
+        ranked.sort(reverse=True)
+        top = ranked[:10]
+
+        lines = ["🚀 SWING MODE — Top 10:"]
+
+        for i, (score, d) in enumerate(top, 1):
+            lines.append(
+                f"{i}) {d['symbol']} | Score {score} | Funding {d['funding']:.4f}"
+            )
+
+        await update.message.reply_text("\n".join(lines))
+
+    except Exception as e:
+        await update.message.reply_text(f"Error: {e}")
+        
 def score_symbol(symbol: str) -> Tuple[int, List[str]]:
     t = fapi_ticker_24h(symbol)
     oi = fapi_open_interest(symbol)
@@ -687,6 +795,49 @@ def score_symbol(symbol: str) -> Tuple[int, List[str]]:
     score = max(0, min(100, score))
     return score, reasons
 
+async def scalp_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        data = build_futures_dataset()
+
+        ranked = []
+
+        for d in data:
+            score = 0
+
+            # Volume weight
+            if d["volume"] > 100_000_000:
+                score += 20
+            elif d["volume"] > 20_000_000:
+                score += 10
+
+            # Trades weight
+            if d["trades"] > 200_000:
+                score += 15
+
+            # Movement weight
+            if abs(d["pct24"]) > 3:
+                score += 10
+
+            # Funding penalty
+            if abs(d["funding"]) > 0.002:
+                score -= 10
+
+            ranked.append((score, d))
+
+        ranked.sort(reverse=True)
+        top = ranked[:10]
+
+        lines = ["⚡ SCALP MODE — Top 10:"]
+
+        for i, (score, d) in enumerate(top, 1):
+            lines.append(
+                f"{i}) {d['symbol']} | Score {score} | Vol {int(d['volume']):,} | 24h {d['pct24']:.2f}%"
+            )
+
+        await update.message.reply_text("\n".join(lines))
+
+    except Exception as e:
+        await update.message.reply_text(f"Error: {e}")
 
 async def futures_score(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -758,6 +909,9 @@ def main():
     app.add_handler(CommandHandler("futures_new", futures_new))
     app.add_handler(CommandHandler("futures_score", futures_score))
     app.add_handler(CommandHandler("futures_top", futures_top))
+    app.add_handler(CommandHandler("scalp_top", scalp_top))
+    app.add_handler(CommandHandler("intraday_top", intraday_top))
+    app.add_handler(CommandHandler("swing_top", swing_top))
 
     print("Bot is running...")
     app.run_polling()
