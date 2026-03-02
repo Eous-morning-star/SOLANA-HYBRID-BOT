@@ -199,6 +199,90 @@ def screen_tokens(chain_id: str = "solana", limit: int = 10) -> List[Dict[str, A
     )
 
     return candidates[:limit]
+
+# -------------------------
+# ADVANCED ALPHA ENGINE
+# -------------------------
+
+MIN_LIQ = 30_000
+MIN_AGE_HOURS = 36
+
+def passes_hard_filters(pair: Dict[str, Any]) -> Tuple[bool, List[str]]:
+    reasons = []
+
+    liq = to_float((pair.get("liquidity") or {}).get("usd"))
+    fdv = to_float(pair.get("fdv"))
+    vol24 = to_float((pair.get("volume") or {}).get("h24"))
+    age_hours = to_float(pair.get("pairAge")) / 3600 if pair.get("pairAge") else 999
+
+    if age_hours < MIN_AGE_HOURS:
+        reasons.append("Age < 36h")
+
+    if liq < MIN_LIQ:
+        reasons.append("Liquidity too low")
+
+    if fdv > 0 and liq > 0:
+        if fdv / liq > 500:
+            reasons.append("Extreme FDV/Liq")
+
+    return (len(reasons) == 0, reasons)
+
+
+def alpha_score(pair: Dict[str, Any]) -> Tuple[int, List[str]]:
+    score = 0
+    reasons = []
+
+    liq = to_float((pair.get("liquidity") or {}).get("usd"))
+    vol24 = to_float((pair.get("volume") or {}).get("h24"))
+    vol5m = to_float((pair.get("volume") or {}).get("m5"))
+    chg1h = to_float((pair.get("priceChange") or {}).get("h1"))
+    chg5m = to_float((pair.get("priceChange") or {}).get("m5"))
+    fdv = to_float(pair.get("fdv"))
+
+    if liq > 80_000:
+        score += 15; reasons.append("Healthy liquidity")
+
+    if vol24 > liq:
+        score += 15; reasons.append("Strong vol/liquidity ratio")
+
+    if vol5m > (vol24 / 288):  # 24h / 5min avg baseline
+        score += 15; reasons.append("5m volume spike")
+
+    if 5 < chg1h < 40:
+        score += 10; reasons.append("Momentum building")
+
+    if chg5m > 3:
+        score += 5; reasons.append("Short-term breakout")
+
+    if liq > 0 and fdv > 0:
+        ratio = fdv / liq
+        if ratio < 250:
+            score += 10; reasons.append("Healthy FDV/Liq")
+
+    return min(score, 100), reasons
+
+
+def get_boosted_pairs(chain="solana") -> List[Dict[str, Any]]:
+    boosted = ds_boosts_latest()
+    pairs = []
+
+    for item in boosted:
+        if item.get("chainId") != chain:
+            continue
+
+        addr = item.get("tokenAddress")
+        if not addr:
+            continue
+
+        try:
+            pools = ds_token_pools(chain, addr)
+            best = pick_best_pair(pools, chain)
+            if best:
+                pairs.append(best)
+        except Exception:
+            continue
+
+    return pairs
     
 def ds_orders(chain_id: str, token_address: str):
     data = http_get(f"{BASE}/orders/v1/{chain_id}/{token_address}")
@@ -586,7 +670,113 @@ async def screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         await update.message.reply_text(f"Error: {e}")
-        
+
+async def alpha(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    pairs = get_boosted_pairs("solana")
+
+    candidates = []
+    for p in pairs:
+        ok, hard_reasons = passes_hard_filters(p)
+        if not ok:
+            continue
+
+        score, reasons = alpha_score(p)
+
+        candidates.append((score, p, reasons))
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    top = candidates[:10]
+
+    if not top:
+        await update.message.reply_text("No alpha candidates passed filters.")
+        return
+
+    lines = ["🔥 ALPHA SCANNER (Top 10)\n"]
+
+    for i, (score, p, reasons) in enumerate(top, 1):
+        sym = (p.get("baseToken") or {}).get("symbol", "UNK")
+        liq = to_float((p.get("liquidity") or {}).get("usd"))
+        vol = to_float((p.get("volume") or {}).get("h24"))
+        url = p.get("url", "")
+
+        lines.append(
+            f"{i}) {sym} | Score {score}/100\n"
+            f"Liq {fmt_money(liq)} | Vol24 {fmt_money(vol)}"
+        )
+        if reasons:
+            lines.append("   • " + " | ".join(reasons))
+        if url:
+            lines.append(url)
+        lines.append("")
+
+    await update.message.reply_text("\n".join(lines))
+
+
+async def early(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    pairs = get_boosted_pairs("solana")
+    lines = ["🚀 EARLY EXPANSION CANDIDATES\n"]
+
+    for p in pairs:
+        liq = to_float((p.get("liquidity") or {}).get("usd"))
+        chg5m = to_float((p.get("priceChange") or {}).get("m5"))
+
+        if 40_000 < liq < 150_000 and chg5m > 3:
+            sym = (p.get("baseToken") or {}).get("symbol", "UNK")
+            lines.append(f"{sym} | Liq {fmt_money(liq)} | 5m {chg5m:.2f}%")
+
+    await update.message.reply_text("\n".join(lines))
+
+
+async def trap(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /trap <symbol>")
+        return
+
+    q = context.args[0]
+    data = ds_search(q)
+    best = pick_best_pair(data.get("pairs") or [], "solana")
+
+    if not best:
+        await update.message.reply_text("Token not found.")
+        return
+
+    liq = to_float((best.get("liquidity") or {}).get("usd"))
+    fdv = to_float(best.get("fdv"))
+    vol = to_float((best.get("volume") or {}).get("h24"))
+
+    ratio = fdv / liq if liq > 0 else 0
+
+    if ratio > 500 and vol < liq:
+        msg = "⚠️ HIGH RUG STRUCTURE DETECTED\n"
+    else:
+        msg = "Structure not immediately suspicious.\n"
+
+    msg += f"FDV/Liq ratio: {ratio:.1f}"
+
+    await update.message.reply_text(msg)
+
+
+async def market(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    pairs = get_boosted_pairs("solana")
+
+    pumps = 0
+    dumps = 0
+
+    for p in pairs:
+        chg1h = to_float((p.get("priceChange") or {}).get("h1"))
+        if chg1h > 10:
+            pumps += 1
+        if chg1h < -10:
+            dumps += 1
+
+    msg = (
+        "📊 MARKET SNAPSHOT\n\n"
+        f"Pumps (>10% 1h): {pumps}\n"
+        f"Dumps (<-10% 1h): {dumps}\n"
+    )
+
+    await update.message.reply_text(msg)
+    
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is missing. Add it in Railway Variables.")
@@ -607,6 +797,11 @@ def main():
     app.add_handler(CommandHandler("takeovers_latest", takeovers_latest))
     app.add_handler(CommandHandler("ads_latest", ads_latest))
     app.add_handler(CommandHandler("orders", orders))
+    app.add_handler(CommandHandler("alpha", alpha))
+    app.add_handler(CommandHandler("early", early))
+    app.add_handler(CommandHandler("trap", trap))
+    app.add_handler(CommandHandler("market", market))
+    
 
     print("Bot is running...")
     app.run_polling()
