@@ -33,7 +33,6 @@ def to_float(x, default=0.0) -> float:
 def fmt_money(x: float) -> str:
     return f"${x:,.0f}"
 
-
 def short(s: str, n: int = 160) -> str:
     if not s:
         return ""
@@ -45,7 +44,6 @@ def is_probably_address(s: str) -> bool:
     # Rough: base58-ish length check for Solana token addresses (not perfect; good enough for UX).
     return bool(re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{32,44}", s))
 
-
 def pick_best_pair(pairs: List[Dict[str, Any]], chain_id: Optional[str] = "solana") -> Optional[Dict[str, Any]]:
     if chain_id:
         pairs = [p for p in pairs if p.get("chainId") == chain_id]
@@ -54,7 +52,6 @@ def pick_best_pair(pairs: List[Dict[str, Any]], chain_id: Optional[str] = "solan
     # pick highest liquidity USD
     pairs.sort(key=lambda p: to_float((p.get("liquidity") or {}).get("usd")), reverse=True)
     return pairs[0]
-
 
 def risk_score(pair: Dict[str, Any]) -> Tuple[int, str, List[str]]:
     """
@@ -501,8 +498,32 @@ def build_bybit_dataset():
             "oi": float(t.get("openInterest", 0)),
             "funding": float(t.get("fundingRate", 0)),
         })
-
     return dataset
+
+import json
+import os
+
+BYBIT_SYMBOL_CACHE = "bybit_symbols.json"
+
+def load_bybit_symbols() -> set:
+    try:
+        if not os.path.exists(BYBIT_SYMBOL_CACHE):
+            return set()
+        with open(BYBIT_SYMBOL_CACHE, "r") as f:
+            return set(json.load(f))
+    except Exception:
+        return set()
+
+def save_bybit_symbols(symbols: set):
+    try:
+        with open(BYBIT_SYMBOL_CACHE, "w") as f:
+            json.dump(sorted(list(symbols)), f)
+    except Exception:
+        pass
+
+def get_current_bybit_symbols() -> set:
+    tickers = bybit_linear_tickers()
+    return {t["symbol"] for t in tickers if t.get("symbol")}
     
 async def boosts_latest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -642,6 +663,7 @@ def score_symbol(symbol: str) -> Tuple[int, List[str]]:
 
     score = max(0, min(100, score))
     return score, reasons
+    
 async def scalp_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         data = build_bybit_dataset()
@@ -677,6 +699,7 @@ async def scalp_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         await update.message.reply_text(f"Error: {e}")
+        
 async def intraday_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         data = build_bybit_dataset()
@@ -739,6 +762,29 @@ async def swing_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(
                 f"{i}) {d['symbol']} | Score {score} | Funding {d['funding']:.4f}"
             )
+
+        await update.message.reply_text("\n".join(lines))
+
+    except Exception as e:
+        await update.message.reply_text(f"Error: {e}")
+
+async def futures_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        current = get_current_bybit_symbols()
+        previous = load_bybit_symbols()
+
+        new_symbols = sorted(list(current - previous))
+
+        # Save updated list
+        save_bybit_symbols(current)
+
+        if not new_symbols:
+            await update.message.reply_text("No new Bybit linear futures listings detected.")
+            return
+
+        lines = ["🆕 New Bybit Linear Futures Listings:"]
+        for sym in new_symbols[:20]:
+            lines.append(f"• {sym}")
 
         await update.message.reply_text("\n".join(lines))
 
