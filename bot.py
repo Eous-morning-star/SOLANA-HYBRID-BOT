@@ -1,6 +1,7 @@
 import os
 import re
 import requests
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from telegram import Update
@@ -10,7 +11,12 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 BASE = "https://api.dexscreener.com"
 TIMEOUT = 20
-
+# -------------------------
+# External APIs (Solana)
+# -------------------------
+BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY")
+BIRDEYE_BASE = "https://public-api.birdeye.so"
+SOLANA_RPC = "https://api.mainnet-beta.solana.com"
 
 # -------------------------
 # Helpers
@@ -298,7 +304,93 @@ def ds_orders(chain_id: str, token_address: str):
 
     return []
 
+# -------------------------
+# HOLDER DISTRIBUTION
+# -------------------------
 
+def birdeye_get(path: str, params: Optional[dict] = None):
+    headers = {"X-API-KEY": BIRDEYE_API_KEY}
+    r = requests.get(f"{BIRDEYE_BASE}{path}", params=params, headers=headers, timeout=TIMEOUT)
+    r.raise_for_status()
+    return r.json()
+
+
+def holder_distribution_score(token: str):
+    try:
+        data = birdeye_get("/token/holder", params={"address": token})
+        holders = data.get("data", {}).get("holders", [])
+
+        if not holders:
+            return 0, ["No holder data"]
+
+        top1 = holders[0]["percentage"]
+        top3 = sum(h["percentage"] for h in holders[:3])
+        top10 = sum(h["percentage"] for h in holders[:10])
+
+        score = 100
+        reasons = []
+
+        if top1 > 12:
+            score -= 40; reasons.append("Top1 > 12%")
+        if top3 > 35:
+            score -= 30; reasons.append("Top3 concentrated")
+        if top10 > 70:
+            score -= 20; reasons.append("Top10 heavy")
+
+        return max(score, 0), reasons
+
+    except Exception as e:
+        return 0, [f"Error: {e}"]
+# -------------------------
+# DEV WALLET CLUSTER
+# -------------------------
+
+def detect_wallet_cluster(token: str):
+    try:
+        data = birdeye_get("/token/holder", params={"address": token})
+        holders = data.get("data", {}).get("holders", [])
+
+        wallets = [h["address"] for h in holders[:10]]
+
+        funders = []
+
+        for w in wallets[:5]:
+            payload = {
+                "jsonrpc":"2.0",
+                "id":1,
+                "method":"getSignaturesForAddress",
+                "params":[w, {"limit":5}]
+            }
+            res = requests.post(SOLANA_RPC, json=payload, timeout=TIMEOUT).json()
+            sigs = res.get("result", [])
+
+            if sigs:
+                funders.append(sigs[0].get("signature"))
+
+        if len(set(funders)) < len(funders):
+            return True
+
+        return False
+
+    except Exception:
+        return False
+
+# -------------------------
+# VOLUME ANOMALY
+# -------------------------
+
+def volume_anomaly(pair: Dict[str, Any]):
+    vol5m = to_float((pair.get("volume") or {}).get("m5"))
+    vol1h = to_float((pair.get("volume") or {}).get("h1"))
+
+    if vol1h == 0:
+        return False, "No 1h data"
+
+    baseline = vol1h / 12  # average per 5m
+    if vol5m > baseline * 3:
+        return True, "5m volume spike > 3x baseline"
+
+    return False, ""
 # -------------------------
 # Telegram commands
 # -------------------------
@@ -776,6 +868,60 @@ async def market(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     await update.message.reply_text(msg)
+async def holders(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /holders <token_address>")
+        return
+
+    token = context.args[0]
+
+    score, reasons = holder_distribution_score(token)
+
+    msg = f"Holder Score: {score}/100\n"
+    if reasons:
+        msg += "⚠️ " + " | ".join(reasons)
+
+    await update.message.reply_text(msg)
+
+
+async def cluster(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /cluster <token_address>")
+        return
+
+    token = context.args[0]
+
+    clustered = detect_wallet_cluster(token)
+
+    if clustered:
+        msg = "⚠️ Possible dev wallet cluster detected"
+    else:
+        msg = "No obvious wallet clustering"
+
+    await update.message.reply_text(msg)
+
+
+async def volume_spike(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /volume_spike <symbol>")
+        return
+
+    q = context.args[0]
+    data = ds_search(q)
+    best = pick_best_pair(data.get("pairs") or [], "solana")
+
+    if not best:
+        await update.message.reply_text("Token not found")
+        return
+
+    spike, reason = volume_anomaly(best)
+
+    if spike:
+        msg = f"🚨 Volume anomaly detected\n{reason}"
+    else:
+        msg = "No abnormal volume spike"
+
+    await update.message.reply_text(msg)
     
 def main():
     if not BOT_TOKEN:
@@ -801,6 +947,9 @@ def main():
     app.add_handler(CommandHandler("early", early))
     app.add_handler(CommandHandler("trap", trap))
     app.add_handler(CommandHandler("market", market))
+    app.add_handler(CommandHandler("holders", holders))
+    app.add_handler(CommandHandler("cluster", cluster))
+    app.add_handler(CommandHandler("volume_spike", volume_spike))
     
 
     print("Bot is running...")
