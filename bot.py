@@ -117,34 +117,26 @@ def risk_score(pair: Dict[str, Any]) -> Tuple[int, str, List[str]]:
 def ds_search(q: str) -> Dict[str, Any]:
     return http_get(f"{BASE}/latest/dex/search", params={"q": q})  # :contentReference[oaicite:1]{index=1}
 
-
 def ds_pairs(chain_id: str, pair_id: str) -> Dict[str, Any]:
     return http_get(f"{BASE}/latest/dex/pairs/{chain_id}/{pair_id}")  # :contentReference[oaicite:2]{index=2}
-
 
 def ds_token_pools(chain_id: str, token_address: str) -> List[Dict[str, Any]]:
     return http_get(f"{BASE}/token-pairs/v1/{chain_id}/{token_address}")  # :contentReference[oaicite:3]{index=3}
 
-
 def ds_tokens_batch(chain_id: str, token_addresses_csv: str) -> List[Dict[str, Any]]:
     return http_get(f"{BASE}/tokens/v1/{chain_id}/{token_addresses_csv}")  # :contentReference[oaicite:4]{index=4}
-
 
 def ds_profiles_latest() -> List[Dict[str, Any]]:
     return http_get(f"{BASE}/token-profiles/latest/v1")  # :contentReference[oaicite:5]{index=5}
 
-
 def ds_takeovers_latest() -> List[Dict[str, Any]]:
     return http_get(f"{BASE}/community-takeovers/latest/v1")  # :contentReference[oaicite:6]{index=6}
-
 
 def ds_ads_latest() -> List[Dict[str, Any]]:
     return http_get(f"{BASE}/ads/latest/v1")  # :contentReference[oaicite:7]{index=7}
 
-
 def ds_boosts_latest() -> List[Dict[str, Any]]:
     return http_get(f"{BASE}/token-boosts/latest/v1")  # :contentReference[oaicite:8]{index=8}
-
 
 def ds_boosts_top() -> List[Dict[str, Any]]:
     return http_get(f"{BASE}/token-boosts/top/v1")  # :contentReference[oaicite:9]{index=9}
@@ -213,57 +205,21 @@ def ds_orders(chain_id: str, token_address: str):
         return []
 
     return []
- # -------------------------
-# Binance USD-M Futures
+# -------------------------
+# Bybit Linear Futures
 # -------------------------
 
-FAPI = "https://fapi.binance.com"
+BYBIT = "https://api.bybit.com"
 
-def fapi_get(path: str, params: Optional[dict] = None) -> Any:
-    return http_get(f"{FAPI}{path}", params=params)
+def bybit_get(path: str, params: Optional[dict] = None) -> Any:
+    return http_get(f"{BYBIT}{path}", params=params)
 
-def fapi_exchange_info() -> Dict[str, Any]:
-    return fapi_get("/fapi/v1/exchangeInfo")
-
-def fapi_ticker_24h(symbol: Optional[str] = None) -> Any:
-    params = {"symbol": symbol} if symbol else None
-    return fapi_get("/fapi/v1/ticker/24hr", params=params)
-
-def fapi_open_interest(symbol: str) -> Dict[str, Any]:
-    return fapi_get("/fapi/v1/openInterest", params={"symbol": symbol})
-
-def fapi_premium_index(symbol: Optional[str] = None) -> Any:
-    params = {"symbol": symbol} if symbol else None
-    return fapi_get("/fapi/v1/premiumIndex", params=params)
-
-def build_futures_dataset():
-    tickers = fapi_ticker_24h()
-    funding = fapi_premium_index()
-
-    if not isinstance(tickers, list) or not isinstance(funding, list):
-        return []
-
-    funding_map = {f["symbol"]: f for f in funding if "symbol" in f}
-
-    dataset = []
-
-    for t in tickers:
-        sym = t.get("symbol")
-        if not sym or not sym.endswith("USDT"):
-            continue
-
-        f = funding_map.get(sym, {})
-
-        dataset.append({
-            "symbol": sym,
-            "volume": float(t.get("quoteVolume", 0)),
-            "trades": float(t.get("count", 0)),
-            "pct24": float(t.get("priceChangePercent", 0)),
-            "funding": float(f.get("lastFundingRate", 0))
-        })
-
-    return dataset
-
+def bybit_linear_tickers() -> List[Dict[str, Any]]:
+    data = bybit_get("/v5/market/tickers", params={"category": "linear"})
+    if data and data.get("result") and data["result"].get("list"):
+        return data["result"]["list"]
+    return []
+ 
 # -------------------------
 # Telegram commands
 # -------------------------
@@ -528,6 +484,25 @@ def _list_preview(items, title: str, n: int = 8) -> str:
             lines.append(f"  {url}")
 
     return "\n".join(lines)
+
+def build_bybit_dataset():
+    tickers = bybit_linear_tickers()
+    dataset = []
+
+    for t in tickers:
+        sym = t.get("symbol")
+        if not sym or not sym.endswith("USDT"):
+            continue
+
+        dataset.append({
+            "symbol": sym,
+            "volume": float(t.get("turnover24h", 0)),
+            "pct24": float(t.get("price24hPcnt", 0)) * 100,
+            "oi": float(t.get("openInterest", 0)),
+            "funding": float(t.get("fundingRate", 0)),
+        })
+
+    return dataset
     
 async def boosts_latest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -637,133 +612,6 @@ async def screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"Error: {e}")
 
-import json
-
-SYMBOL_CACHE_FILE = "fapi_symbols.json"
-
-def load_symbol_cache() -> set:
-    try:
-        with open(SYMBOL_CACHE_FILE, "r") as f:
-            return set(json.load(f))
-    except Exception:
-        return set()
-
-def save_symbol_cache(symbols: set) -> None:
-    try:
-        with open(SYMBOL_CACHE_FILE, "w") as f:
-            json.dump(sorted(list(symbols)), f)
-    except Exception:
-        pass
-
-def get_current_futures_symbols() -> set:
-    info = fapi_exchange_info()
-    syms = set()
-    for s in info.get("symbols", []):
-        if s.get("status") == "TRADING":
-            syms.add(s.get("symbol"))
-    return {x for x in syms if x}
-
-
-async def futures_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        current = get_current_futures_symbols()
-        prev = load_symbol_cache()
-
-        new_syms = sorted(list(current - prev))
-        save_symbol_cache(current)
-
-        if not new_syms:
-            await update.message.reply_text("No new Futures symbols detected.")
-            return
-
-        await update.message.reply_text(
-            "🆕 New Binance Futures listings:\n" +
-            "\n".join([f"• {s}" for s in new_syms[:20]])
-        )
-
-    except Exception as e:
-        await update.message.reply_text(f"Error: {e}")
-
-async def intraday_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        data = build_futures_dataset()
-
-        ranked = []
-
-        for d in data:
-            score = 0
-
-            # Momentum bias
-            if d["pct24"] > 5:
-                score += 15
-            elif d["pct24"] < -5:
-                score += 10  # short bias
-
-            # Volume filter
-            if d["volume"] > 50_000_000:
-                score += 15
-
-            # Funding sanity
-            if abs(d["funding"]) < 0.001:
-                score += 10
-            else:
-                score -= 5
-
-            ranked.append((score, d))
-
-        ranked.sort(reverse=True)
-        top = ranked[:10]
-
-        lines = ["📈 INTRADAY MODE — Top 10:"]
-
-        for i, (score, d) in enumerate(top, 1):
-            lines.append(
-                f"{i}) {d['symbol']} | Score {score} | 24h {d['pct24']:.2f}%"
-            )
-
-        await update.message.reply_text("\n".join(lines))
-
-    except Exception as e:
-        await update.message.reply_text(f"Error: {e}")
-
-async def swing_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        data = build_futures_dataset()
-
-        ranked = []
-
-        for d in data:
-            score = 0
-
-            # Stable trend preference
-            if 2 < d["pct24"] < 10:
-                score += 15
-
-            # High participation
-            if d["volume"] > 80_000_000:
-                score += 15
-
-            # Funding neutral preferred
-            if abs(d["funding"]) < 0.0008:
-                score += 10
-
-            ranked.append((score, d))
-
-        ranked.sort(reverse=True)
-        top = ranked[:10]
-
-        lines = ["🚀 SWING MODE — Top 10:"]
-
-        for i, (score, d) in enumerate(top, 1):
-            lines.append(
-                f"{i}) {d['symbol']} | Score {score} | Funding {d['funding']:.4f}"
-            )
-
-        await update.message.reply_text("\n".join(lines))
-
-    except Exception as e:
-        await update.message.reply_text(f"Error: {e}")
-        
 def score_symbol(symbol: str) -> Tuple[int, List[str]]:
     t = fapi_ticker_24h(symbol)
     oi = fapi_open_interest(symbol)
@@ -794,31 +642,23 @@ def score_symbol(symbol: str) -> Tuple[int, List[str]]:
 
     score = max(0, min(100, score))
     return score, reasons
-
 async def scalp_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        data = build_futures_dataset()
-
+        data = build_bybit_dataset()
         ranked = []
 
         for d in data:
             score = 0
 
-            # Volume weight
-            if d["volume"] > 100_000_000:
+            if d["volume"] > 50_000_000:
                 score += 20
-            elif d["volume"] > 20_000_000:
-                score += 10
 
-            # Trades weight
-            if d["trades"] > 200_000:
+            if abs(d["pct24"]) > 3:
                 score += 15
 
-            # Movement weight
-            if abs(d["pct24"]) > 3:
+            if d["oi"] > 20_000_000:
                 score += 10
 
-            # Funding penalty
             if abs(d["funding"]) > 0.002:
                 score -= 10
 
@@ -827,11 +667,44 @@ async def scalp_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ranked.sort(reverse=True)
         top = ranked[:10]
 
-        lines = ["⚡ SCALP MODE — Top 10:"]
-
+        lines = ["⚡ BYBIT SCALP MODE — Top 10:"]
         for i, (score, d) in enumerate(top, 1):
             lines.append(
-                f"{i}) {d['symbol']} | Score {score} | Vol {int(d['volume']):,} | 24h {d['pct24']:.2f}%"
+                f"{i}) {d['symbol']} | Score {score} | 24h {d['pct24']:.2f}% | Funding {d['funding']:.4f}"
+            )
+
+        await update.message.reply_text("\n".join(lines))
+
+    except Exception as e:
+        await update.message.reply_text(f"Error: {e}")
+async def intraday_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        data = build_bybit_dataset()
+        ranked = []
+
+        for d in data:
+            score = 0
+
+            if d["pct24"] > 5:
+                score += 20
+            elif d["pct24"] < -5:
+                score += 15
+
+            if d["volume"] > 100_000_000:
+                score += 15
+
+            if abs(d["funding"]) < 0.001:
+                score += 10
+
+            ranked.append((score, d))
+
+        ranked.sort(reverse=True)
+        top = ranked[:10]
+
+        lines = ["📈 BYBIT INTRADAY MODE — Top 10:"]
+        for i, (score, d) in enumerate(top, 1):
+            lines.append(
+                f"{i}) {d['symbol']} | Score {score} | 24h {d['pct24']:.2f}%"
             )
 
         await update.message.reply_text("\n".join(lines))
@@ -839,47 +712,33 @@ async def scalp_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"Error: {e}")
 
-async def futures_score(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Usage: /futures_score BTCUSDT")
-        return
-
-    symbol = context.args[0].upper().strip()
-
+async def swing_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        score, reasons = score_symbol(symbol)
-
-        msg = f"📊 {symbol} Futures Score: {score}/100\n"
-        msg += "\n".join([f"• {r}" for r in reasons])
-        msg += "\n\nHeuristic ranking — not financial advice."
-
-        await update.message.reply_text(msg)
-
-    except Exception as e:
-        await update.message.reply_text(f"Error: {e}")
-
-
-async def futures_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        all_tickers = fapi_ticker_24h()
-
+        data = build_bybit_dataset()
         ranked = []
-        for t in all_tickers:
-            sym = t.get("symbol")
-            if not sym or not sym.endswith("USDT"):
-                continue
 
-            qv = float(t.get("quoteVolume", 0.0))
-            pct = abs(float(t.get("priceChangePercent", 0.0)))
+        for d in data:
+            score = 0
 
-            ranked.append((qv * (1 + pct/100), sym))
+            if 2 < d["pct24"] < 10:
+                score += 15
+
+            if d["volume"] > 150_000_000:
+                score += 20
+
+            if abs(d["funding"]) < 0.0008:
+                score += 10
+
+            ranked.append((score, d))
 
         ranked.sort(reverse=True)
         top = ranked[:10]
 
-        lines = ["🔥 Top 10 Futures Watchlist:"]
-        for i, (_, sym) in enumerate(top, 1):
-            lines.append(f"{i}) {sym}")
+        lines = ["🚀 BYBIT SWING MODE — Top 10:"]
+        for i, (score, d) in enumerate(top, 1):
+            lines.append(
+                f"{i}) {d['symbol']} | Score {score} | Funding {d['funding']:.4f}"
+            )
 
         await update.message.reply_text("\n".join(lines))
 
