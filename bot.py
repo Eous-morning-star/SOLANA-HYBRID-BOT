@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import requests
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -8,7 +9,12 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
+# DexScreener
 BASE = "https://api.dexscreener.com"
+
+# Bybit (Linear USDT Perps)
+BYBIT_BASE = "https://api.bybit.com"
+
 TIMEOUT = 20
 
 
@@ -51,7 +57,6 @@ def pick_best_pair(pairs: List[Dict[str, Any]], chain_id: Optional[str] = "solan
         pairs = [p for p in pairs if p.get("chainId") == chain_id]
     if not pairs:
         return None
-    # pick highest liquidity USD
     pairs.sort(key=lambda p: to_float((p.get("liquidity") or {}).get("usd")), reverse=True)
     return pairs[0]
 
@@ -70,7 +75,6 @@ def risk_score(pair: Dict[str, Any]) -> Tuple[int, str, List[str]]:
     score = 50
     reasons: List[str] = []
 
-    # Liquidity
     if liq >= 200_000:
         score += 20; reasons.append("Strong liquidity")
     elif liq >= 50_000:
@@ -80,7 +84,6 @@ def risk_score(pair: Dict[str, Any]) -> Tuple[int, str, List[str]]:
     else:
         score -= 15; reasons.append("Very low liquidity")
 
-    # Volume vs liquidity
     if liq > 0:
         v_ratio = vol24 / liq
         if v_ratio >= 2.0:
@@ -92,7 +95,6 @@ def risk_score(pair: Dict[str, Any]) -> Tuple[int, str, List[str]]:
     else:
         score -= 10; reasons.append("No liquidity data")
 
-    # FDV vs liquidity (rough)
     if liq > 0 and fdv > 0:
         fdv_liq = fdv / liq
         if fdv_liq >= 500:
@@ -100,7 +102,6 @@ def risk_score(pair: Dict[str, Any]) -> Tuple[int, str, List[str]]:
         elif fdv_liq >= 200:
             score -= 5; reasons.append("FDV high vs liquidity")
 
-    # Sudden moves
     if chg5m >= 20 or chg1h >= 50:
         score -= 5; reasons.append("Sharp pump risk")
     if chg5m <= -20 or chg1h <= -50:
@@ -112,55 +113,64 @@ def risk_score(pair: Dict[str, Any]) -> Tuple[int, str, List[str]]:
 
 
 # -------------------------
-# DexScreener endpoints (from reference)
+# DexScreener endpoints
 # -------------------------
 def ds_search(q: str) -> Dict[str, Any]:
-    return http_get(f"{BASE}/latest/dex/search", params={"q": q})  # :contentReference[oaicite:1]{index=1}
+    return http_get(f"{BASE}/latest/dex/search", params={"q": q})
 
 
 def ds_pairs(chain_id: str, pair_id: str) -> Dict[str, Any]:
-    return http_get(f"{BASE}/latest/dex/pairs/{chain_id}/{pair_id}")  # :contentReference[oaicite:2]{index=2}
+    return http_get(f"{BASE}/latest/dex/pairs/{chain_id}/{pair_id}")
 
 
 def ds_token_pools(chain_id: str, token_address: str) -> List[Dict[str, Any]]:
-    return http_get(f"{BASE}/token-pairs/v1/{chain_id}/{token_address}")  # :contentReference[oaicite:3]{index=3}
+    return http_get(f"{BASE}/token-pairs/v1/{chain_id}/{token_address}")
 
 
 def ds_tokens_batch(chain_id: str, token_addresses_csv: str) -> List[Dict[str, Any]]:
-    return http_get(f"{BASE}/tokens/v1/{chain_id}/{token_addresses_csv}")  # :contentReference[oaicite:4]{index=4}
+    return http_get(f"{BASE}/tokens/v1/{chain_id}/{token_addresses_csv}")
 
 
 def ds_profiles_latest() -> List[Dict[str, Any]]:
-    return http_get(f"{BASE}/token-profiles/latest/v1")  # :contentReference[oaicite:5]{index=5}
+    return http_get(f"{BASE}/token-profiles/latest/v1")
 
 
 def ds_takeovers_latest() -> List[Dict[str, Any]]:
-    return http_get(f"{BASE}/community-takeovers/latest/v1")  # :contentReference[oaicite:6]{index=6}
+    return http_get(f"{BASE}/community-takeovers/latest/v1")
 
 
 def ds_ads_latest() -> List[Dict[str, Any]]:
-    return http_get(f"{BASE}/ads/latest/v1")  # :contentReference[oaicite:7]{index=7}
+    return http_get(f"{BASE}/ads/latest/v1")
 
 
 def ds_boosts_latest() -> List[Dict[str, Any]]:
-    return http_get(f"{BASE}/token-boosts/latest/v1")  # :contentReference[oaicite:8]{index=8}
+    return http_get(f"{BASE}/token-boosts/latest/v1")
 
 
 def ds_boosts_top() -> List[Dict[str, Any]]:
-    return http_get(f"{BASE}/token-boosts/top/v1")  # :contentReference[oaicite:9]{index=9}
+    return http_get(f"{BASE}/token-boosts/top/v1")
+
+
+def ds_orders(chain_id: str, token_address: str):
+    data = http_get(f"{BASE}/orders/v1/{chain_id}/{token_address}")
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        if "data" in data and isinstance(data["data"], list):
+            return data["data"]
+        return []
+    return []
+
 
 def screen_tokens(chain_id: str = "solana", limit: int = 10) -> List[Dict[str, Any]]:
     boosted = ds_boosts_latest()
-
     if not isinstance(boosted, list):
         return []
 
     candidates = []
-
     for item in boosted:
         if not isinstance(item, dict):
             continue
-
         if item.get("chainId") != chain_id:
             continue
 
@@ -178,18 +188,10 @@ def screen_tokens(chain_id: str = "solana", limit: int = 10) -> List[Dict[str, A
                 continue
 
             score, label, reasons = risk_score(best)
-
-            candidates.append({
-                "pair": best,
-                "score": score,
-                "label": label,
-                "reasons": reasons
-            })
-
+            candidates.append({"pair": best, "score": score, "label": label, "reasons": reasons})
         except Exception:
             continue
 
-    # sort by score then liquidity
     candidates.sort(
         key=lambda x: (
             x["score"],
@@ -197,22 +199,142 @@ def screen_tokens(chain_id: str = "solana", limit: int = 10) -> List[Dict[str, A
         ),
         reverse=True
     )
-
     return candidates[:limit]
-    
-def ds_orders(chain_id: str, token_address: str):
-    data = http_get(f"{BASE}/orders/v1/{chain_id}/{token_address}")
 
-    # Normalize to list
-    if isinstance(data, list):
-        return data
 
-    if isinstance(data, dict):
-        if "data" in data and isinstance(data["data"], list):
-            return data["data"]
-        return []
+# -------------------------
+# Bybit (Linear USDT Perps) endpoints + scoring
+# -------------------------
+BYBIT_SYMBOL_CACHE = "bybit_symbols.json"  # NOTE: on free Railway this may reset after restarts
 
-    return []
+def bybit_get(path: str, params: Optional[dict] = None) -> Any:
+    data = http_get(f"{BYBIT_BASE}{path}", params=params)
+    # Bybit v5 response: {"retCode":0,"retMsg":"OK","result":{...}}
+    if isinstance(data, dict) and data.get("retCode") not in (0, "0", None):
+        raise RuntimeError(f"Bybit API error: retCode={data.get('retCode')} retMsg={data.get('retMsg')}")
+    return data
+
+def bybit_linear_tickers() -> List[Dict[str, Any]]:
+    data = bybit_get("/v5/market/tickers", params={"category": "linear"})
+    result = (data or {}).get("result") or {}
+    lst = result.get("list")
+    return lst if isinstance(lst, list) else []
+
+def build_bybit_dataset() -> List[Dict[str, Any]]:
+    tickers = bybit_linear_tickers()
+    dataset: List[Dict[str, Any]] = []
+
+    for t in tickers:
+        sym = t.get("symbol")
+        if not sym or not sym.endswith("USDT"):
+            continue
+
+        # Bybit fields are strings; normalize
+        volume = to_float(t.get("turnover24h"), 0.0)
+        pct24 = to_float(t.get("price24hPcnt"), 0.0) * 100.0
+        oi = to_float(t.get("openInterest"), 0.0)
+        funding = to_float(t.get("fundingRate"), 0.0)
+        last = to_float(t.get("lastPrice"), 0.0)
+
+        dataset.append({
+            "symbol": sym,
+            "volume": volume,
+            "pct24": pct24,
+            "oi": oi,
+            "funding": funding,
+            "last": last,
+        })
+
+    return dataset
+
+def load_bybit_symbols() -> set:
+    try:
+        with open(BYBIT_SYMBOL_CACHE, "r") as f:
+            data = json.load(f)
+            return set(data) if isinstance(data, list) else set()
+    except Exception:
+        return set()
+
+def save_bybit_symbols(symbols: set) -> None:
+    try:
+        with open(BYBIT_SYMBOL_CACHE, "w") as f:
+            json.dump(sorted(list(symbols)), f)
+    except Exception:
+        pass
+
+def get_current_bybit_symbols() -> set:
+    tickers = bybit_linear_tickers()
+    return {t.get("symbol") for t in tickers if t.get("symbol")}
+
+def score_bybit_symbol(d: Dict[str, Any], mode: str) -> Tuple[int, List[str], str]:
+    """
+    mode: 'scalp' | 'intraday' | 'swing'
+    Returns: (score 0-100, reasons, bias)
+    bias is informational: LONG / SHORT / NEUTRAL (based on pct24 sign only)
+    """
+    vol = d["volume"]
+    pct = d["pct24"]
+    oi = d["oi"]
+    funding = d["funding"]
+
+    reasons: List[str] = []
+    score = 50
+
+    bias = "NEUTRAL"
+    if pct >= 1.5:
+        bias = "LONG"
+    elif pct <= -1.5:
+        bias = "SHORT"
+
+    # Shared liquidity/activity
+    if vol >= 150_000_000:
+        score += 18; reasons.append("Very high turnover")
+    elif vol >= 50_000_000:
+        score += 10; reasons.append("High turnover")
+    elif vol < 5_000_000:
+        score -= 12; reasons.append("Low turnover")
+
+    # Open interest (participation proxy)
+    if oi >= 20_000_000:
+        score += 8; reasons.append("High open interest")
+    elif oi < 500_000:
+        score -= 6; reasons.append("Low open interest")
+
+    # Funding crowdedness penalty
+    if abs(funding) >= 0.003:
+        score -= 14; reasons.append("Funding extreme (crowded)")
+    elif abs(funding) >= 0.0015:
+        score -= 7; reasons.append("Funding elevated")
+
+    if mode == "scalp":
+        # Prefer high activity + movement; avoid extreme funding
+        if abs(pct) >= 6:
+            score += 10; reasons.append("Strong 24h movement")
+        elif abs(pct) >= 3:
+            score += 6; reasons.append("Good movement")
+        elif abs(pct) < 1:
+            score -= 4; reasons.append("Low movement")
+
+    elif mode == "intraday":
+        # Prefer clear directional momentum without being totally manic
+        if pct >= 5:
+            score += 10; reasons.append("Positive momentum")
+        if pct <= -5:
+            score += 10; reasons.append("Negative momentum (short-side interest)")
+        if abs(pct) >= 12:
+            score -= 6; reasons.append("Possibly overextended")
+
+    elif mode == "swing":
+        # Prefer moderate trend + neutral funding
+        if 2 <= pct <= 10:
+            score += 8; reasons.append("Moderate uptrend")
+        if -10 <= pct <= -2:
+            score += 8; reasons.append("Moderate downtrend")
+        if abs(funding) <= 0.0008:
+            score += 8; reasons.append("Funding near-neutral (healthier)")
+
+    score = int(max(0, min(100, score)))
+    return score, reasons[:5], bias
 
 
 # -------------------------
@@ -220,21 +342,23 @@ def ds_orders(chain_id: str, token_address: str):
 # -------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "DexScreener Bot (Solana-first)\n\n"
-        "Core:\n"
+        "DexScreener Bot (Solana-first) + Bybit Futures Analytics\n\n"
+        "DexScreener:\n"
         "  /check <symbol|address> [chainId]\n"
         "  /score <symbol|address> [chainId]\n"
         "  /pools <tokenAddress> [chainId]\n"
         "  /pair <pairId> [chainId]\n"
-        "  /tokens <addr1,addr2,...> [chainId]\n\n"
+        "  /tokens <addr1,addr2,...> [chainId]\n"
+        "  /screen [chainId]  -> boosted-token screen\n\n"
         "Discovery/Meta:\n"
-        "  /boosts_latest\n"
-        "  /boosts_top\n"
-        "  /profiles_latest\n"
-        "  /takeovers_latest\n"
-        "  /ads_latest\n"
+        "  /boosts_latest | /boosts_top | /profiles_latest | /takeovers_latest | /ads_latest\n"
         "  /orders <tokenAddress> [chainId]\n\n"
-        "Tip: addresses are more accurate than symbols."
+        "Bybit Futures (Linear USDT):\n"
+        "  /futures_new       -> detect new Bybit listings (diff vs last run)\n"
+        "  /scalp_top         -> top 10 (fast liquidity + movement)\n"
+        "  /intraday_top      -> top 10 (directional momentum)\n"
+        "  /swing_top         -> top 10 (moderate trend + neutral funding)\n\n"
+        "Note: Scores are heuristics for focus, not guaranteed trade signals."
     )
 
 
@@ -274,7 +398,6 @@ async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg += f"\nChart: {url}"
 
         await update.message.reply_text(msg)
-
     except Exception as e:
         await update.message.reply_text(f"Error: {e}")
 
@@ -320,7 +443,6 @@ async def score_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg += f"\n\nChart: {url}"
 
         await update.message.reply_text(msg)
-
     except Exception as e:
         await update.message.reply_text(f"Error: {e}")
 
@@ -339,23 +461,21 @@ async def pools(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("No pools found.")
             return
 
-        # top 5 by liquidity
         items.sort(key=lambda p: to_float((p.get("liquidity") or {}).get("usd")), reverse=True)
         top = items[:5]
 
         lines = [f"Top pools for {token} [{chain}] (top 5 by liquidity):"]
         for p in top:
             dex = p.get("dexId", "N/A")
-            pair = p.get("pairAddress", "N/A")
+            pair_addr = p.get("pairAddress", "N/A")
             liq = to_float((p.get("liquidity") or {}).get("usd"))
             price = p.get("priceUsd", "N/A")
             url = p.get("url", "")
-            lines.append(f"• {dex} | liq {fmt_money(liq)} | price ${price} | pair {pair}")
+            lines.append(f"• {dex} | liq {fmt_money(liq)} | price ${price} | pair {pair_addr}")
             if url:
                 lines.append(f"  {url}")
 
         await update.message.reply_text("\n".join(lines))
-
     except Exception as e:
         await update.message.reply_text(f"Error: {e}")
 
@@ -396,7 +516,6 @@ async def pair(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg += f"\nChart: {url}"
 
         await update.message.reply_text(msg)
-
     except Exception as e:
         await update.message.reply_text(f"Error: {e}")
 
@@ -415,7 +534,6 @@ async def tokens(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("No results.")
             return
 
-        # show top 10 by liquidity
         items.sort(key=lambda p: to_float((p.get("liquidity") or {}).get("usd")), reverse=True)
         top = items[:10]
 
@@ -428,31 +546,22 @@ async def tokens(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"• {base} | price ${price} | liq {fmt_money(liq)} | pair {pair_addr}")
 
         await update.message.reply_text("\n".join(lines))
-
     except Exception as e:
         await update.message.reply_text(f"Error: {e}")
 
 
 def _list_preview(items, title: str, n: int = 8) -> str:
-    # Normalize response structure safely
-
     if isinstance(items, dict):
-        # Try common container keys
         if "data" in items:
             items = items["data"]
         elif "pairs" in items:
             items = items["pairs"]
         else:
-            # If dict but not structured as expected, wrap it
             items = [items]
-
-    # If still not list, force into list
     if not isinstance(items, list):
         items = [items]
 
     lines = [title]
-
-    # Safe slicing
     for it in items[: min(n, len(items))]:
         if not isinstance(it, dict):
             continue
@@ -464,21 +573,18 @@ def _list_preview(items, title: str, n: int = 8) -> str:
         url = it.get("url", "")
 
         bits = []
-        if chain:
-            bits.append(chain)
-        if addr:
-            bits.append(addr)
-        if typ:
-            bits.append(f"type={typ}")
-        if date:
-            bits.append(f"date={date}")
+        if chain: bits.append(chain)
+        if addr: bits.append(addr)
+        if typ: bits.append(f"type={typ}")
+        if date: bits.append(f"date={date}")
 
         lines.append("• " + " | ".join(bits))
-
         if url:
             lines.append(f"  {url}")
 
     return "\n".join(lines)
+
+
 async def boosts_latest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         items = ds_boosts_latest()
@@ -529,40 +635,32 @@ async def orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         items = ds_orders(chain, token)
-
         if not items:
             await update.message.reply_text("No paid orders found.")
             return
 
         lines = [f"Orders for {token} [{chain}] (preview):"]
-
         for it in items[:min(8, len(items))]:
             if not isinstance(it, dict):
                 continue
-
             lines.append(
-                f"• type={it.get('type')} | "
-                f"status={it.get('status')} | "
-                f"paymentTs={it.get('paymentTimestamp')}"
+                f"• type={it.get('type')} | status={it.get('status')} | paymentTs={it.get('paymentTimestamp')}"
             )
 
         await update.message.reply_text("\n".join(lines))
-
     except Exception as e:
         await update.message.reply_text(f"Error: {e}")
 
+
 async def screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chain = context.args[0].strip() if context.args else "solana"
-
     try:
         results = screen_tokens(chain_id=chain, limit=10)
-
         if not results:
             await update.message.reply_text("No candidates found.")
             return
 
         lines = [f"Screen Results [{chain}] (boosted tokens):\n"]
-
         for idx, item in enumerate(results, start=1):
             p = item["pair"]
             base = (p.get("baseToken") or {}).get("symbol", "UNK")
@@ -576,23 +674,122 @@ async def screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"Score: {item['score']}/100 — {item['label']}\n"
                 f"Liq: {fmt_money(liq)} | Vol24: {fmt_money(vol24)}"
             )
-
             if url:
                 lines.append(url)
-
             lines.append("")
 
         await update.message.reply_text("\n".join(lines))
-
     except Exception as e:
         await update.message.reply_text(f"Error: {e}")
-        
+
+
+# -------------------------
+# Bybit Futures Telegram commands
+# -------------------------
+async def futures_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Detect newly seen Bybit linear symbols compared to last cached run.
+    First ever run will likely show many/most as "new".
+    """
+    try:
+        current = get_current_bybit_symbols()
+        previous = load_bybit_symbols()
+
+        new_symbols = sorted(list((current - previous) if previous else current))
+        save_bybit_symbols(current)
+
+        if not new_symbols:
+            await update.message.reply_text("No new Bybit linear futures listings detected.")
+            return
+
+        lines = ["🆕 New Bybit Linear Futures symbols (diff vs last run):"]
+        for sym in new_symbols[:25]:
+            lines.append(f"• {sym}")
+
+        await update.message.reply_text("\n".join(lines))
+    except Exception as e:
+        await update.message.reply_text(f"Error: {e}")
+
+
+async def scalp_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        data = build_bybit_dataset()
+        ranked = []
+        for d in data:
+            s, reasons, bias = score_bybit_symbol(d, mode="scalp")
+            ranked.append((s, d, reasons, bias))
+        ranked.sort(key=lambda x: (x[0], x[1]["volume"]), reverse=True)
+        top = ranked[:10]
+
+        lines = ["⚡ Bybit SCALP MODE — Top 10 (heuristic focus list):"]
+        for i, (s, d, reasons, bias) in enumerate(top, 1):
+            lines.append(
+                f"{i}) {d['symbol']} | Score {s}/100 | Bias {bias} | 24h {d['pct24']:.2f}% | "
+                f"Turnover {fmt_money(d['volume'])} | Funding {d['funding']:.4f}"
+            )
+            if reasons:
+                lines.append("   • " + " | ".join(reasons))
+        lines.append("\nNote: Not a guaranteed signal—use your setup rules.")
+        await update.message.reply_text("\n".join(lines))
+    except Exception as e:
+        await update.message.reply_text(f"Error: {e}")
+
+
+async def intraday_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        data = build_bybit_dataset()
+        ranked = []
+        for d in data:
+            s, reasons, bias = score_bybit_symbol(d, mode="intraday")
+            ranked.append((s, d, reasons, bias))
+        ranked.sort(key=lambda x: (x[0], x[1]["volume"]), reverse=True)
+        top = ranked[:10]
+
+        lines = ["📈 Bybit INTRADAY MODE — Top 10 (heuristic focus list):"]
+        for i, (s, d, reasons, bias) in enumerate(top, 1):
+            lines.append(
+                f"{i}) {d['symbol']} | Score {s}/100 | Bias {bias} | 24h {d['pct24']:.2f}% | "
+                f"Turnover {fmt_money(d['volume'])} | Funding {d['funding']:.4f}"
+            )
+            if reasons:
+                lines.append("   • " + " | ".join(reasons))
+        lines.append("\nNote: Not a guaranteed signal—use your setup rules.")
+        await update.message.reply_text("\n".join(lines))
+    except Exception as e:
+        await update.message.reply_text(f"Error: {e}")
+
+
+async def swing_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        data = build_bybit_dataset()
+        ranked = []
+        for d in data:
+            s, reasons, bias = score_bybit_symbol(d, mode="swing")
+            ranked.append((s, d, reasons, bias))
+        ranked.sort(key=lambda x: (x[0], x[1]["volume"]), reverse=True)
+        top = ranked[:10]
+
+        lines = ["🚀 Bybit SWING MODE — Top 10 (heuristic focus list):"]
+        for i, (s, d, reasons, bias) in enumerate(top, 1):
+            lines.append(
+                f"{i}) {d['symbol']} | Score {s}/100 | Bias {bias} | 24h {d['pct24']:.2f}% | "
+                f"Turnover {fmt_money(d['volume'])} | Funding {d['funding']:.4f}"
+            )
+            if reasons:
+                lines.append("   • " + " | ".join(reasons))
+        lines.append("\nNote: Not a guaranteed signal—use your setup rules.")
+        await update.message.reply_text("\n".join(lines))
+    except Exception as e:
+        await update.message.reply_text(f"Error: {e}")
+
+
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is missing. Add it in Railway Variables.")
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
+    # DexScreener
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("check", check))
     app.add_handler(CommandHandler("score", score_cmd))
@@ -607,6 +804,12 @@ def main():
     app.add_handler(CommandHandler("takeovers_latest", takeovers_latest))
     app.add_handler(CommandHandler("ads_latest", ads_latest))
     app.add_handler(CommandHandler("orders", orders))
+
+    # Bybit Futures
+    app.add_handler(CommandHandler("futures_new", futures_new))
+    app.add_handler(CommandHandler("scalp_top", scalp_top))
+    app.add_handler(CommandHandler("intraday_top", intraday_top))
+    app.add_handler(CommandHandler("swing_top", swing_top))
 
     print("Bot is running...")
     app.run_polling()
