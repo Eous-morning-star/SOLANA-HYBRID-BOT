@@ -33,6 +33,7 @@ def to_float(x, default=0.0) -> float:
 def fmt_money(x: float) -> str:
     return f"${x:,.0f}"
 
+
 def short(s: str, n: int = 160) -> str:
     if not s:
         return ""
@@ -44,6 +45,7 @@ def is_probably_address(s: str) -> bool:
     # Rough: base58-ish length check for Solana token addresses (not perfect; good enough for UX).
     return bool(re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{32,44}", s))
 
+
 def pick_best_pair(pairs: List[Dict[str, Any]], chain_id: Optional[str] = "solana") -> Optional[Dict[str, Any]]:
     if chain_id:
         pairs = [p for p in pairs if p.get("chainId") == chain_id]
@@ -52,6 +54,7 @@ def pick_best_pair(pairs: List[Dict[str, Any]], chain_id: Optional[str] = "solan
     # pick highest liquidity USD
     pairs.sort(key=lambda p: to_float((p.get("liquidity") or {}).get("usd")), reverse=True)
     return pairs[0]
+
 
 def risk_score(pair: Dict[str, Any]) -> Tuple[int, str, List[str]]:
     """
@@ -114,26 +117,34 @@ def risk_score(pair: Dict[str, Any]) -> Tuple[int, str, List[str]]:
 def ds_search(q: str) -> Dict[str, Any]:
     return http_get(f"{BASE}/latest/dex/search", params={"q": q})  # :contentReference[oaicite:1]{index=1}
 
+
 def ds_pairs(chain_id: str, pair_id: str) -> Dict[str, Any]:
     return http_get(f"{BASE}/latest/dex/pairs/{chain_id}/{pair_id}")  # :contentReference[oaicite:2]{index=2}
+
 
 def ds_token_pools(chain_id: str, token_address: str) -> List[Dict[str, Any]]:
     return http_get(f"{BASE}/token-pairs/v1/{chain_id}/{token_address}")  # :contentReference[oaicite:3]{index=3}
 
+
 def ds_tokens_batch(chain_id: str, token_addresses_csv: str) -> List[Dict[str, Any]]:
     return http_get(f"{BASE}/tokens/v1/{chain_id}/{token_addresses_csv}")  # :contentReference[oaicite:4]{index=4}
+
 
 def ds_profiles_latest() -> List[Dict[str, Any]]:
     return http_get(f"{BASE}/token-profiles/latest/v1")  # :contentReference[oaicite:5]{index=5}
 
+
 def ds_takeovers_latest() -> List[Dict[str, Any]]:
     return http_get(f"{BASE}/community-takeovers/latest/v1")  # :contentReference[oaicite:6]{index=6}
+
 
 def ds_ads_latest() -> List[Dict[str, Any]]:
     return http_get(f"{BASE}/ads/latest/v1")  # :contentReference[oaicite:7]{index=7}
 
+
 def ds_boosts_latest() -> List[Dict[str, Any]]:
     return http_get(f"{BASE}/token-boosts/latest/v1")  # :contentReference[oaicite:8]{index=8}
+
 
 def ds_boosts_top() -> List[Dict[str, Any]]:
     return http_get(f"{BASE}/token-boosts/top/v1")  # :contentReference[oaicite:9]{index=9}
@@ -202,21 +213,8 @@ def ds_orders(chain_id: str, token_address: str):
         return []
 
     return []
-# -------------------------
-# Bybit Linear Futures
-# -------------------------
 
-BYBIT = "https://api.bybit.com"
 
-def bybit_get(path: str, params: Optional[dict] = None) -> Any:
-    return http_get(f"{BYBIT}{path}", params=params)
-
-def bybit_linear_tickers() -> List[Dict[str, Any]]:
-    data = bybit_get("/v5/market/tickers", params={"category": "linear"})
-    if data and data.get("result") and data["result"].get("list"):
-        return data["result"]["list"]
-    return []
- 
 # -------------------------
 # Telegram commands
 # -------------------------
@@ -481,50 +479,6 @@ def _list_preview(items, title: str, n: int = 8) -> str:
             lines.append(f"  {url}")
 
     return "\n".join(lines)
-
-def build_bybit_dataset():
-    tickers = bybit_linear_tickers()
-    dataset = []
-
-    for t in tickers:
-        sym = t.get("symbol")
-        if not sym or not sym.endswith("USDT"):
-            continue
-
-        dataset.append({
-            "symbol": sym,
-            "volume": float(t.get("turnover24h", 0)),
-            "pct24": float(t.get("price24hPcnt", 0)) * 100,
-            "oi": float(t.get("openInterest", 0)),
-            "funding": float(t.get("fundingRate", 0)),
-        })
-    return dataset
-
-import json
-import os
-
-BYBIT_SYMBOL_CACHE = "bybit_symbols.json"
-
-def load_bybit_symbols() -> set:
-    try:
-        if not os.path.exists(BYBIT_SYMBOL_CACHE):
-            return set()
-        with open(BYBIT_SYMBOL_CACHE, "r") as f:
-            return set(json.load(f))
-    except Exception:
-        return set()
-
-def save_bybit_symbols(symbols: set):
-    try:
-        with open(BYBIT_SYMBOL_CACHE, "w") as f:
-            json.dump(sorted(list(symbols)), f)
-    except Exception:
-        pass
-
-def get_current_bybit_symbols() -> set:
-    tickers = bybit_linear_tickers()
-    return {t["symbol"] for t in tickers if t.get("symbol")}
-    
 async def boosts_latest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         items = ds_boosts_latest()
@@ -632,164 +586,6 @@ async def screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         await update.message.reply_text(f"Error: {e}")
-
-def score_symbol(symbol: str) -> Tuple[int, List[str]]:
-    t = fapi_ticker_24h(symbol)
-    oi = fapi_open_interest(symbol)
-    pi = fapi_premium_index(symbol)
-
-    quote_vol = float(t.get("quoteVolume", 0.0))
-    trades = float(t.get("count", 0.0))
-    pct = float(t.get("priceChangePercent", 0.0))
-    funding = float(pi.get("lastFundingRate", 0.0))
-    open_interest = float(oi.get("openInterest", 0.0))
-
-    score = 50
-    reasons = []
-
-    if quote_vol >= 100_000_000:
-        score += 15; reasons.append("Very high volume")
-    elif quote_vol < 5_000_000:
-        score -= 10; reasons.append("Low volume")
-
-    if trades >= 200_000:
-        score += 5; reasons.append("High activity")
-
-    if abs(funding) >= 0.002:
-        score -= 10; reasons.append("Funding extreme (crowded trade)")
-
-    if open_interest >= 50_000_000:
-        score += 5; reasons.append("High open interest")
-
-    score = max(0, min(100, score))
-    return score, reasons
-    
-async def scalp_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        data = build_bybit_dataset()
-        ranked = []
-
-        for d in data:
-            score = 0
-
-            if d["volume"] > 50_000_000:
-                score += 20
-
-            if abs(d["pct24"]) > 3:
-                score += 15
-
-            if d["oi"] > 20_000_000:
-                score += 10
-
-            if abs(d["funding"]) > 0.002:
-                score -= 10
-
-            ranked.append((score, d))
-
-        ranked.sort(reverse=True)
-        top = ranked[:10]
-
-        lines = ["⚡ BYBIT SCALP MODE — Top 10:"]
-        for i, (score, d) in enumerate(top, 1):
-            lines.append(
-                f"{i}) {d['symbol']} | Score {score} | 24h {d['pct24']:.2f}% | Funding {d['funding']:.4f}"
-            )
-
-        await update.message.reply_text("\n".join(lines))
-
-    except Exception as e:
-        await update.message.reply_text(f"Error: {e}")
-        
-async def intraday_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        data = build_bybit_dataset()
-        ranked = []
-
-        for d in data:
-            score = 0
-
-            if d["pct24"] > 5:
-                score += 20
-            elif d["pct24"] < -5:
-                score += 15
-
-            if d["volume"] > 100_000_000:
-                score += 15
-
-            if abs(d["funding"]) < 0.001:
-                score += 10
-
-            ranked.append((score, d))
-
-        ranked.sort(reverse=True)
-        top = ranked[:10]
-
-        lines = ["📈 BYBIT INTRADAY MODE — Top 10:"]
-        for i, (score, d) in enumerate(top, 1):
-            lines.append(
-                f"{i}) {d['symbol']} | Score {score} | 24h {d['pct24']:.2f}%"
-            )
-
-        await update.message.reply_text("\n".join(lines))
-
-    except Exception as e:
-        await update.message.reply_text(f"Error: {e}")
-
-async def swing_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        data = build_bybit_dataset()
-        ranked = []
-
-        for d in data:
-            score = 0
-
-            if 2 < d["pct24"] < 10:
-                score += 15
-
-            if d["volume"] > 150_000_000:
-                score += 20
-
-            if abs(d["funding"]) < 0.0008:
-                score += 10
-
-            ranked.append((score, d))
-
-        ranked.sort(reverse=True)
-        top = ranked[:10]
-
-        lines = ["🚀 BYBIT SWING MODE — Top 10:"]
-        for i, (score, d) in enumerate(top, 1):
-            lines.append(
-                f"{i}) {d['symbol']} | Score {score} | Funding {d['funding']:.4f}"
-            )
-
-        await update.message.reply_text("\n".join(lines))
-
-    except Exception as e:
-        await update.message.reply_text(f"Error: {e}")
-
-async def futures_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        current = get_current_bybit_symbols()
-        previous = load_bybit_symbols()
-
-        new_symbols = sorted(list(current - previous))
-
-        # Save updated list
-        save_bybit_symbols(current)
-
-        if not new_symbols:
-            await update.message.reply_text("No new Bybit linear futures listings detected.")
-            return
-
-        lines = ["🆕 New Bybit Linear Futures Listings:"]
-        for sym in new_symbols[:20]:
-            lines.append(f"• {sym}")
-
-        await update.message.reply_text("\n".join(lines))
-
-    except Exception as e:
-        await update.message.reply_text(f"Error: {e}")
         
 def main():
     if not BOT_TOKEN:
@@ -811,12 +607,6 @@ def main():
     app.add_handler(CommandHandler("takeovers_latest", takeovers_latest))
     app.add_handler(CommandHandler("ads_latest", ads_latest))
     app.add_handler(CommandHandler("orders", orders))
-    app.add_handler(CommandHandler("futures_new", futures_new))
-    app.add_handler(CommandHandler("futures_score", futures_score))
-    app.add_handler(CommandHandler("futures_top", futures_top))
-    app.add_handler(CommandHandler("scalp_top", scalp_top))
-    app.add_handler(CommandHandler("intraday_top", intraday_top))
-    app.add_handler(CommandHandler("swing_top", swing_top))
 
     print("Bot is running...")
     app.run_polling()
